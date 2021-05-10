@@ -218,6 +218,7 @@ dependencies = [
 name = "min-gi"
 version = "0.1.0"
 dependencies = [
+ "bitflags",
  "bytemuck",
  "image",
  "nalgebra",

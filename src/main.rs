@@ -1,6 +1,8 @@
 pub use nalgebra as na;
 pub use nalgebra_glm as glm;
 use rayon::prelude::*;
+#[macro_use]
+extern crate bitflags;
 use std::{
     alloc::dealloc,
     cell::{RefCell, UnsafeCell},
@@ -449,6 +451,7 @@ pub trait Sampler: Sync + Send {
 pub trait Camera: Sync + Send {
     fn generate_ray(&self, pixel: &glm::UVec2, sampler: &mut dyn Sampler) -> Ray;
     fn resolution(&self) -> glm::UVec2;
+    fn we(&self, ray: &Ray) -> (Option<glm::UVec2>, Spectrum);
 }
 #[derive(Clone, Copy)]
 pub struct LightRaySample {
@@ -470,10 +473,19 @@ pub struct ReferencePoint {
     pub p: Vec3,
     pub n: Vec3,
 }
+bitflags! {
+    pub struct LightFlags : u8 {
+        const NONE = 0b0;
+        const DELTA_POSITION = 0b1;
+        const DELTA_DIRECTION = 0b10;
+        const DELTA = Self::DELTA_POSITION.bits | Self::DELTA_DIRECTION.bits;
+    }
+}
 pub trait Light: Sync + Send {
     fn sample_le(&self, u: &[Vec2; 2]) -> LightRaySample;
     fn sample_li(&self, u: &Vec2, p: &ReferencePoint) -> LightSample;
     fn le(&self, ray: &Ray) -> Spectrum;
+    fn flags(&self) -> LightFlags;
 }
 
 #[derive(Clone)]
@@ -937,6 +949,7 @@ struct PerspectiveCamera {
     fov: Float,
     r2c: Transform,
     c2r: Transform,
+    a: Float,
 }
 impl PerspectiveCamera {
     fn new(resolution: &glm::UVec2, transform: &Transform, fov: Float) -> Self {
@@ -956,6 +969,15 @@ impl PerspectiveCamera {
             m = glm::scale(&glm::identity(), &Vec3::new(s * fres.x / fres.y, s, 1.0)) * m;
         }
         let r2c = Transform::from_matrix(&m);
+        let a = {
+            let p_min = r2c.transform_point(&Vec3::new(0.0, 0.0, 0.0));
+            let p_max = r2c.transform_point(&Vec3::new(
+                resolution.x as Float,
+                resolution.y as Float,
+                0.0,
+            ));
+            ((p_max.x - p_min.x) * (p_max.y * p_min.y)).abs()
+        };
         Self {
             resolution: *resolution,
             c2w: *transform,
@@ -963,6 +985,7 @@ impl PerspectiveCamera {
             r2c,
             c2r: r2c.inverse().unwrap(),
             fov,
+            a,
         }
     }
 }
@@ -981,12 +1004,39 @@ impl Camera for PerspectiveCamera {
             &glm::zero(),
             &glm::normalize(&(Vec3::new(p.x, p.y, 0.0) - Vec3::new(0.0, 0.0, 1.0))),
         );
+        // ray.tmin = (1.0 / ray.d.z).abs();
         ray.o = self.c2w.transform_point(&ray.o);
         ray.d = self.c2w.transform_vector(&ray.d);
         ray
     }
     fn resolution(&self) -> glm::UVec2 {
         self.resolution
+    }
+    fn we(&self, ray: &Ray) -> (Option<glm::UVec2>, Spectrum) {
+        let cos_theta = glm::dot(
+            &ray.d,
+            &self.c2w.transform_vector(&Vec3::new(0.0, 0.0, -1.0)),
+        );
+        if cos_theta <= 0.0 {
+            return (None, Spectrum::zero());
+        }
+        let p_focus = ray.at(1.0 / cos_theta);
+        let p_raster = self
+            .c2r
+            .transform_point(&self.w2c.transform_point(&p_focus));
+        if p_raster.x < 0.0
+            || p_raster.x >= self.resolution().x as Float
+            || p_raster.y < 0.0
+            || p_raster.y >= self.resolution().y as Float
+        {
+            return (None, Spectrum::zero());
+        }
+        let lens_area = 1.0;
+        let cos2_theta = cos_theta * cos_theta;
+        (
+            Some(glm::UVec2::new(p_raster.x as u32, p_raster.y as u32)),
+            Spectrum::one() / (self.a * lens_area * cos2_theta * cos2_theta),
+        )
     }
 }
 struct NullBSDF {}
@@ -1062,6 +1112,9 @@ impl Light for PointLight {
     fn le(&self, _: &Ray) -> Spectrum {
         unimplemented!("point light cannot be hit")
     }
+    fn flags(&self) -> LightFlags {
+        LightFlags::DELTA_DIRECTION | LightFlags::DELTA_POSITION
+    }
 }
 struct DiffuseBSDF {
     reflecance: Spectrum,
@@ -1097,10 +1150,10 @@ impl BSDF for DiffuseBSDF {
         })
     }
 }
-struct Scene {
-    shape: Arc<dyn Shape>,
-    camera: Arc<dyn Camera>,
-    lights: Vec<Arc<dyn Light>>,
+pub struct Scene {
+    pub shape: Arc<dyn Shape>,
+    pub camera: Arc<dyn Camera>,
+    pub lights: Vec<Arc<dyn Light>>,
 }
 
 trait Integrator {
@@ -1605,6 +1658,202 @@ impl Integrator for SPPM {
     }
 }
 
+struct BDPT {
+    spp: usize,
+    max_depth: usize,
+}
+mod bdpt {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    struct VertexBase {
+        pdf_fwd: Float,
+        pdf_rev: Float,
+        delta: bool,
+    }
+    #[derive(Clone)]
+    pub struct SurfaceVertex<'a> {
+        bsdf: BSDFClosure<'a>,
+        p: Vec3,
+        n: Vec3,
+        base: VertexBase,
+    }
+    #[derive(Clone)]
+    pub struct CameraVertex<'a> {
+        camera: &'a dyn Camera,
+        base: VertexBase,
+    }
+    #[derive(Clone)]
+    pub struct LightVertex<'a> {
+        light: &'a dyn Light,
+        base: VertexBase,
+    }
+    #[derive(Clone)]
+    pub enum Vertex<'a> {
+        Camera(CameraVertex<'a>),
+        Light(LightVertex<'a>),
+        Surface(SurfaceVertex<'a>),
+    }
+
+    impl<'a> Vertex<'a> {
+        fn create_surface_vertex(
+            p: Vec3,
+            bsdf: BSDFClosure<'a>,
+            n: Vec3,
+            mut pdf_fwd: Float,
+            prev: &Vertex<'a>,
+        ) -> Self {
+            let mut v = Self::Surface(SurfaceVertex {
+                bsdf,
+                n,
+                base: VertexBase {
+                    pdf_fwd: 0.0,
+                    pdf_rev: 0.0,
+                    delta: false,
+                },
+                p,
+            });
+            pdf_fwd = prev.convert_pdf_to_area(pdf_fwd, &v);
+            v.base_mut().pdf_fwd = pdf_fwd;
+            v
+        }
+        pub fn base(&self) -> &VertexBase {
+            match self {
+                Self::Surface(v) => &v.base,
+                Self::Light(v) => &v.base,
+                Self::Camera(v) => &v.base,
+            }
+        }
+        pub fn base_mut(&mut self) -> &mut VertexBase {
+            match self {
+                Self::Surface(v) => &mut v.base,
+                Self::Light(v) => &mut v.base,
+                Self::Camera(v) => &mut v.base,
+            }
+        }
+        pub fn pdf(&self, scene: &Scene, prev: Option<&Vertex<'a>>, next: &Vertex<'a>) -> Float {
+            let p2 = next.p();
+            let p = self.p();
+            match self {
+                Vertex::Surface(v) => {
+                    let p1 = prev.unwrap().p();
+                    let wo = glm::normalize(&(p1 - p));
+                    let wi = glm::normalize(&(p2 - p));
+                    v.bsdf.evaluate_pdf(&wo, &wi)
+                }
+                _ => unreachable!(),
+            }
+        }
+        pub fn pdf_fwd(&self) -> Float {
+            self.base().pdf_fwd
+        }
+        pub fn p(&self) -> Vec3 {
+            match self {
+                Vertex::Surface(v) => v.p,
+                _ => unreachable!(),
+            }
+        }
+        pub fn n(&self) -> Vec3 {
+            match self {
+                Vertex::Surface(v) => v.n,
+                _ => unreachable!(),
+            }
+        }
+        pub fn convert_pdf_to_area(&self, mut pdf: Float, v2: &Vertex) -> Float {
+            let w = v2.p() - self.p();
+            let inv_dist2 = 1.0 / glm::dot(&w, &w);
+            pdf *= glm::dot(&v2.n(), &(w * inv_dist2.sqrt()));
+            pdf * inv_dist2
+        }
+        pub fn connectible(&self) -> bool {
+            match self {
+                Vertex::Light(v) => {
+                    let flags = v.light.flags();
+                    (flags | LightFlags::DELTA) == LightFlags::NONE
+                }
+                Vertex::Camera(_) => true,
+                Vertex::Surface(v) => true,
+            }
+        }
+    }
+    pub enum TransportMode {
+        IMPORTANCE,
+        RADIANCE,
+    }
+    pub fn random_walk<'a>(
+        scene: &'a Scene,
+        mut ray: Ray,
+        sampler: &mut dyn Sampler,
+        mut beta: Spectrum,
+        pdf: Float,
+        max_depth: usize,
+        mode: TransportMode,
+        path: &mut Path<'a>,
+    ) {
+        assert!(path.len() == 1);
+        if max_depth == 0 {
+            return;
+        }
+        let mut pdf_fwd = pdf;
+        let mut pdf_rev = 0.0;
+        let mut depth = 0usize;
+        loop {
+            if let Some(isct) = scene.shape.intersect(&ray) {
+                let ng = isct.ng;
+                let frame = Frame::from_normal(&ng);
+                let shape = isct.shape;
+                let opt_bsdf = shape.bsdf();
+                if opt_bsdf.is_none() {
+                    break;
+                }
+                let p = ray.at(isct.t);
+                let bsdf = BSDFClosure {
+                    frame,
+                    bsdf: opt_bsdf.unwrap(),
+                };
+                let wo = -ray.d;
+                if depth >= max_depth {
+                    break;
+                }
+                let prev_index = depth;
+                // let this_index = prev_index + 1;
+                let prev = &mut path[prev_index];
+                let vertex = Vertex::create_surface_vertex(p, bsdf.clone(), ng, pdf_fwd, prev);
+                // pdf_rev = vertex.pdf(scene, prev, next)
+                depth += 1;
+
+                if let Some(bsdf_sample) = bsdf.sample(&sampler.next2d(), &wo) {
+                    pdf_fwd = bsdf_sample.pdf;
+                    let wi = &bsdf_sample.wi;
+                    {
+                        pdf_rev = bsdf.evaluate_pdf(&wi, &wo);
+                        prev.base_mut().pdf_rev = vertex.convert_pdf_to_area(pdf_rev, prev);
+                    }
+                    ray = Ray::spawn(&p, wi).offset_along_normal(&ng);
+                    beta *= bsdf_sample.f * glm::dot(wi, &ng).abs() / bsdf_sample.pdf;
+                    path.push(vertex);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    pub type Path<'a> = Vec<Vertex<'a>>;
+    pub fn geometry_term(v1: &Vertex, v2: &Vertex) -> Float {
+        let mut wi = v1.p() - v2.p();
+        let dist2: Float = glm::dot(&wi, &wi);
+        wi /= dist2.sqrt();
+        (glm::dot(&wi, &v1.n()) * glm::dot(&wi, &v2.n()) / dist2).abs()
+    }
+}
+impl Integrator for BDPT {
+    type Output = Film;
+    fn render(&mut self, scene: &Scene) -> Self::Output {
+        let npixels = (scene.camera.resolution().x * scene.camera.resolution().y) as usize;
+        let film = RwLock::new(Film::new(&scene.camera.resolution()));
+        film.into_inner().unwrap()
+    }
+}
 fn main() {
     let white = Arc::new(DiffuseBSDF {
         reflecance: Spectrum::one(),
@@ -1666,16 +1915,16 @@ fn main() {
         camera,
         lights,
     };
-    let mut integrator = PathTracer {
-        spp: 32,
-        max_depth: 5,
-    };
-    // let mut integrator = SPPM {
-    //     initial_radius: 0.1,
-    //     iterations: 64,
+    // let mut integrator = PathTracer {
+    //     spp: 32,
     //     max_depth: 5,
-    //     n_photons: 100000,
     // };
+    let mut integrator = SPPM {
+        initial_radius: 0.1,
+        iterations: 64,
+        max_depth: 5,
+        n_photons: 100000,
+    };
     let film = integrator.render(&scene);
     let image = film.to_rgb_image();
     image.save("out-pt.png").unwrap();
