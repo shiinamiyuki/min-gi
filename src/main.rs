@@ -7,6 +7,7 @@ use std::{
     alloc::dealloc,
     cell::{RefCell, UnsafeCell},
     collections::{HashMap, LinkedList},
+    hash::Hasher,
     mem::MaybeUninit,
     ops::{Deref, Index, IndexMut, Mul},
     sync::{
@@ -486,8 +487,40 @@ pub trait Light: Sync + Send {
     fn sample_li(&self, u: &Vec2, p: &ReferencePoint) -> LightSample;
     fn le(&self, ray: &Ray) -> Spectrum;
     fn flags(&self) -> LightFlags;
+    fn address(&self) -> usize; // ????
 }
-
+pub trait LightDistribution: Sync + Send {
+    fn sample<'a>(&'a self, u: Float) -> (&'a dyn Light, Float);
+    fn pdf<'a>(&self, light: &'a dyn Light) -> Float;
+}
+struct UniformLightDistribution {
+    lights: Vec<Arc<dyn Light>>,
+    pdf_map: HashMap<usize, Float>,
+}
+impl UniformLightDistribution {
+    pub fn new(lights: Vec<Arc<dyn Light>>) -> Self {
+        let mut pdf_map = HashMap::new();
+        let pdf = 1.0 / lights.len() as Float;
+        for i in &lights {
+            pdf_map.insert(i.address(), pdf);
+        }
+        Self { lights, pdf_map }
+    }
+}
+impl LightDistribution for UniformLightDistribution {
+    fn sample<'a>(&'a self, u: Float) -> (&'a dyn Light, Float) {
+        let idx = (u * self.lights.len() as Float) as usize;
+        let pdf = 1.0 / self.lights.len() as Float;
+        (self.lights[idx].as_ref(), pdf)
+    }
+    fn pdf<'a>(&self, light: &'a dyn Light) -> Float {
+        if let Some(pdf) = self.pdf_map.get(&light.address()) {
+            *pdf
+        } else {
+            0.0
+        }
+    }
+}
 #[derive(Clone)]
 pub struct BSDFClosure<'a> {
     pub frame: Frame,
@@ -1115,6 +1148,9 @@ impl Light for PointLight {
     fn flags(&self) -> LightFlags {
         LightFlags::DELTA_DIRECTION | LightFlags::DELTA_POSITION
     }
+    fn address(&self) -> usize {
+        self as *const PointLight as usize
+    }
 }
 struct DiffuseBSDF {
     reflecance: Spectrum,
@@ -1154,6 +1190,7 @@ pub struct Scene {
     pub shape: Arc<dyn Shape>,
     pub camera: Arc<dyn Camera>,
     pub lights: Vec<Arc<dyn Light>>,
+    pub light_distr: Arc<dyn LightDistribution>,
 }
 
 trait Integrator {
@@ -1670,6 +1707,8 @@ mod bdpt {
         pdf_fwd: Float,
         pdf_rev: Float,
         delta: bool,
+        beta: Spectrum,
+        wo: Vec3,
     }
     #[derive(Clone)]
     pub struct SurfaceVertex<'a> {
@@ -1696,9 +1735,23 @@ mod bdpt {
     }
 
     impl<'a> Vertex<'a> {
+        fn create_light_vertex(light: &'a dyn Light, beta: Spectrum, pdf_fwd: Float) -> Self {
+            Self::Light(LightVertex {
+                light,
+                base: VertexBase {
+                    wo: glm::zero(),
+                    pdf_fwd,
+                    pdf_rev: 0.0,
+                    delta: (light.flags() | LightFlags::DELTA) != LightFlags::NONE,
+                    beta,
+                },
+            })
+        }
         fn create_surface_vertex(
+            beta: Spectrum,
             p: Vec3,
             bsdf: BSDFClosure<'a>,
+            wo: Vec3,
             n: Vec3,
             mut pdf_fwd: Float,
             prev: &Vertex<'a>,
@@ -1707,6 +1760,8 @@ mod bdpt {
                 bsdf,
                 n,
                 base: VertexBase {
+                    beta,
+                    wo,
                     pdf_fwd: 0.0,
                     pdf_rev: 0.0,
                     delta: false,
@@ -1716,6 +1771,31 @@ mod bdpt {
             pdf_fwd = prev.convert_pdf_to_area(pdf_fwd, &v);
             v.base_mut().pdf_fwd = pdf_fwd;
             v
+        }
+        pub fn on_surface(&self) -> bool {
+            match self {
+                Self::Camera(_v) => false,
+                Self::Surface(_v) => true,
+                Self::Light(_v) => false, //????
+            }
+        }
+        pub fn as_camera(&self) -> Option<&CameraVertex> {
+            match self {
+                Self::Camera(v) => Some(v),
+                _ => None,
+            }
+        }
+        pub fn as_surface(&self) -> Option<&SurfaceVertex> {
+            match self {
+                Self::Surface(v) => Some(v),
+                _ => None,
+            }
+        }
+        pub fn as_light(&self) -> Option<&LightVertex> {
+            match self {
+                Self::Light(v) => Some(v),
+                _ => None,
+            }
         }
         pub fn base(&self) -> &VertexBase {
             match self {
@@ -1743,6 +1823,15 @@ mod bdpt {
                 }
                 _ => unreachable!(),
             }
+        }
+        pub fn f(&self, next: &Vertex<'a>, _mode: TransportMode) -> Spectrum {
+            let v1 = self.as_surface().unwrap();
+            let v2 = next.as_surface().unwrap();
+            let wi = glm::normalize(&(next.p() - self.p()));
+            v1.bsdf.evaluate(&self.base().wo, &wi)
+        }
+        pub fn beta(&self) -> Spectrum {
+            self.base().beta
         }
         pub fn pdf_fwd(&self) -> Float {
             self.base().pdf_fwd
@@ -1787,7 +1876,7 @@ mod bdpt {
         mut beta: Spectrum,
         pdf: Float,
         max_depth: usize,
-        mode: TransportMode,
+        _mode: TransportMode,
         path: &mut Path<'a>,
     ) {
         assert!(path.len() == 1);
@@ -1818,7 +1907,8 @@ mod bdpt {
                 let prev_index = depth;
                 // let this_index = prev_index + 1;
                 let prev = &mut path[prev_index];
-                let vertex = Vertex::create_surface_vertex(p, bsdf.clone(), ng, pdf_fwd, prev);
+                let vertex =
+                    Vertex::create_surface_vertex(beta, p, bsdf.clone(), wo, ng, pdf_fwd, prev);
                 // pdf_rev = vertex.pdf(scene, prev, next)
                 depth += 1;
 
@@ -1838,12 +1928,124 @@ mod bdpt {
             }
         }
     }
+    pub fn generate_camera_path<'a>(
+        scene: &'a Scene,
+        sampler: &mut dyn Sampler,
+        max_depth: usize,
+        path: &mut Path<'a>,
+    ) {
+        path.clear();
+    }
+    pub fn generate_light_path<'a>(
+        scene: &'a Scene,
+        sampler: &mut dyn Sampler,
+        max_depth: usize,
+        path: &mut Path<'a>,
+    ) {
+        path.clear();
+        let (light, light_pdf) = scene.light_distr.sample(sampler.next1d());
+        let sample = light.sample_le(&[sampler.next2d(), sampler.next2d()]);
+        let le = sample.le;
+        let beta = le / (sample.pdf_dir * sample.pdf_pos * light_pdf)
+            * glm::dot(&sample.ray.d, &sample.n).abs();
+        let vertex = Vertex::create_light_vertex(light, le, light_pdf);
+        path.push(vertex);
+        random_walk(
+            scene,
+            sample.ray,
+            sampler,
+            beta,
+            sample.pdf_dir,
+            max_depth - 1,
+            TransportMode::IMPORTANCE,
+            path,
+        );
+    }
     pub type Path<'a> = Vec<Vertex<'a>>;
-    pub fn geometry_term(v1: &Vertex, v2: &Vertex) -> Float {
+    pub fn geometry_term(scene: &Scene, v1: &Vertex, v2: &Vertex) -> Float {
         let mut wi = v1.p() - v2.p();
         let dist2: Float = glm::dot(&wi, &wi);
         wi /= dist2.sqrt();
-        (glm::dot(&wi, &v1.n()) * glm::dot(&wi, &v2.n()) / dist2).abs()
+        let ray = Ray::spawn_to(&v1.p(), &v2.p()).offset_along_normal(&v1.n());
+        if scene.shape.occlude(&ray) {
+            0.0
+        } else {
+            (glm::dot(&wi, &v1.n()) * glm::dot(&wi, &v2.n()) / dist2).abs()
+        }
+    }
+    #[derive(Debug, Clone, Copy)]
+    pub struct ConnectionStrategy {
+        pub s: usize,
+        pub t: usize,
+    }
+    pub fn connect_paths<'a>(
+        scene: &'a Scene,
+        strat: ConnectionStrategy,
+        light_path: &Path<'a>,
+        eye_path: &Path<'a>,
+        sampler: &mut dyn Sampler,
+    ) -> Spectrum {
+        let s = strat.s;
+        let t = strat.t;
+        let mut sampled: Option<Vertex> = None;
+        let mut l = Spectrum::zero();
+        if t > 1 && s != 0 && eye_path[t - 1].as_light().is_some() {
+            return Spectrum::zero();
+        } else if s == 0 {
+            unreachable!();
+        }else if t == 1 {
+            unreachable!();
+        } else if s == 1 {
+            let pt = &eye_path[t - 1];
+            if pt.connectible() {
+                let (light, light_pdf) = scene.light_distr.sample(sampler.next1d());
+                let p_ref = ReferencePoint {
+                    p: pt.p(),
+                    n: pt.n(),
+                };
+                let light_sample = light.sample_li(&sampler.next2d(), &p_ref);
+                if !light_sample.li.is_black() {
+                    {
+                        let mut v = Vertex::create_light_vertex(
+                            light,
+                            light_sample.li / (light_sample.pdf * light_pdf),
+                            0.0,
+                        );
+                        v.base_mut().pdf_fwd = 1.0; //v.pdf_light_origin()
+                        sampled = Some(v);
+                    }
+                    {
+                        let sampled = sampled.as_ref().unwrap();
+                        l = pt.beta() * pt.f(sampled, TransportMode::RADIANCE) * sampled.beta();
+                    }
+
+                    if pt.on_surface() {
+                        l *= glm::dot(&light_sample.wi, &p_ref.n).abs();
+                    }
+                    if scene.shape.occlude(&light_sample.shadow_ray) {
+                        l *= 0.0;
+                    }
+                    // li += beta
+                    //     * bsdf.evaluate(&wo, &light_sample.wi)
+                    //     * glm::dot(&ng, &light_sample.wi).abs()
+                    //     * light_sample.li
+                    //     / light_sample.pdf;
+                }
+            }
+        } else {
+            let pt = &eye_path[t - 1];
+            let qs = &light_path[s - 1];
+            if pt.connectible() && qs.connectible() {
+                l = qs.beta()
+                    * qs.beta()
+                    * pt.f(qs, TransportMode::RADIANCE)
+                    * qs.f(pt, TransportMode::IMPORTANCE);
+                if !l.is_black() {
+                    l *= geometry_term(scene, pt, qs);
+                }
+            }
+        }
+        l
     }
 }
 impl Integrator for BDPT {
@@ -1913,7 +2115,8 @@ fn main() {
     let scene = Scene {
         shape,
         camera,
-        lights,
+        lights: lights.clone(),
+        light_distr: Arc::new(UniformLightDistribution::new(lights.clone())),
     };
     // let mut integrator = PathTracer {
     //     spp: 32,
