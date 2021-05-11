@@ -488,6 +488,8 @@ bitflags! {
 pub trait Light: Sync + Send {
     fn sample_le(&self, u: &[Vec2; 2]) -> LightRaySample;
     fn sample_li(&self, u: &Vec2, p: &ReferencePoint) -> LightSample;
+    fn pdf_le(&self, ray: &Ray) -> (Float, Float);
+    fn pdf_li(&self, wi: &Vec3, p: &ReferencePoint) -> Float;
     fn le(&self, ray: &Ray) -> Spectrum;
     fn flags(&self) -> LightFlags;
     fn address(&self) -> usize; // ????
@@ -524,7 +526,7 @@ impl LightDistribution for UniformLightDistribution {
         }
     }
 }
-#[derive(Clone)]
+#[derive(Copy, Clone)]
 pub struct BSDFClosure<'a> {
     pub frame: Frame,
     pub bsdf: &'a dyn BSDF,
@@ -1172,6 +1174,12 @@ impl Light for PointLight {
             p: self.position,
         }
     }
+    fn pdf_le(&self, ray: &Ray) -> (Float, Float) {
+        (0.0, uniform_sphere_pdf())
+    }
+    fn pdf_li(&self, wi: &Vec3, p: &ReferencePoint) -> Float {
+        0.0
+    }
     fn le(&self, _: &Ray) -> Spectrum {
         Spectrum::zero()
         // unimplemented!("point light cannot be hit")
@@ -1739,23 +1747,23 @@ mod bdpt {
         p: Vec3,
         n: Vec3,
     }
-    #[derive(Clone)]
+    #[derive(Copy, Clone)]
     pub struct SurfaceVertex<'a> {
         bsdf: BSDFClosure<'a>,
         n: Vec3,
         base: VertexBase,
     }
-    #[derive(Clone)]
+    #[derive(Copy, Clone)]
     pub struct CameraVertex<'a> {
         camera: &'a dyn Camera,
         base: VertexBase,
     }
-    #[derive(Clone)]
+    #[derive(Copy, Clone)]
     pub struct LightVertex<'a> {
         light: &'a dyn Light,
         base: VertexBase,
     }
-    #[derive(Clone)]
+    #[derive(Copy, Clone)]
     pub enum Vertex<'a> {
         Camera(CameraVertex<'a>),
         Light(LightVertex<'a>),
@@ -1866,10 +1874,37 @@ mod bdpt {
                 Self::Camera(v) => &mut v.base,
             }
         }
+        pub fn pdf_light_origin(&self, scene: &Scene, next: &Vertex) -> Float {
+            match self {
+                Vertex::Light(v) => {
+                    let light_pdf = scene.light_distr.pdf(v.light);
+                    let wi = glm::normalize(&(next.p() - self.p()));
+                    let pdf = v.light.pdf_li(
+                        &wi,
+                        &ReferencePoint {
+                            p: self.p(),
+                            n: self.n(),
+                        },
+                    );
+                    self.convert_pdf_to_area(light_pdf * pdf, next)
+                }
+                _ => unreachable!(),
+            }
+        }
+        pub fn pdf_light(&self, scene: &Scene, next: &Vertex) -> Float {
+            match self {
+                Vertex::Light(v) => {
+                    let ray = Ray::spawn_to(&self.p(), &next.p());
+                    let (_pdf_pos, pdf_dir) = v.light.pdf_le(&ray);
+                    self.convert_pdf_to_area(pdf_dir, next)
+                }
+                _ => unreachable!(),
+            }
+        }
         pub fn pdf(&self, scene: &Scene, prev: Option<&Vertex<'a>>, next: &Vertex<'a>) -> Float {
             let p2 = next.p();
             let p = self.p();
-            match self {
+            let pdf = match self {
                 Vertex::Surface(v) => {
                     let p1 = prev.unwrap().p();
                     let wo = glm::normalize(&(p1 - p));
@@ -1877,7 +1912,8 @@ mod bdpt {
                     v.bsdf.evaluate_pdf(&wo, &wi)
                 }
                 _ => unreachable!(),
-            }
+            };
+            self.convert_pdf_to_area(pdf, next)
         }
         pub fn f(&self, next: &Vertex<'a>, _mode: TransportMode) -> Spectrum {
             let v1 = self.as_surface().unwrap();
@@ -1907,7 +1943,9 @@ mod bdpt {
         pub fn convert_pdf_to_area(&self, mut pdf: Float, v2: &Vertex) -> Float {
             let w = v2.p() - self.p();
             let inv_dist2 = 1.0 / glm::dot(&w, &w);
-            pdf *= glm::dot(&v2.n(), &(w * inv_dist2.sqrt()));
+            if v2.on_surface() {
+                pdf *= glm::dot(&v2.n(), &(w * inv_dist2.sqrt()));
+            }
             pdf * inv_dist2
         }
         pub fn connectible(&self) -> bool {
@@ -2052,12 +2090,140 @@ mod bdpt {
         pub s: usize,
         pub t: usize,
     }
+    pub struct Scratch<'a> {
+        new_light_path: Path<'a>,
+        new_eye_path: Path<'a>,
+        // strat:Option<ConnectionStrategy>,
+    }
+    impl<'a> Scratch<'a> {
+        pub fn new() -> Self {
+            Self {
+                new_light_path: Vec::new(),
+                new_eye_path: Vec::new(),
+            }
+        }
+    }
+    pub fn mis_weight<'a>(
+        scene: &'a Scene,
+        strat: ConnectionStrategy,
+        original_light_path: &Path<'a>,
+        original_eye_path: &Path<'a>,
+        sampled: Option<Vertex<'a>>,
+        scratch: &mut Scratch<'a>,
+    ) -> Float {
+        let s = strat.s;
+        let t = strat.t;
+        // 1.0 / (s + t - 1) as Float
+        if s + t == 2 {
+            return 1.0;
+        }
+        let eye_path = &mut scratch.new_eye_path;
+        let light_path = &mut scratch.new_light_path;
+        eye_path.clear();
+        light_path.clear();
+        for i in 0..s {
+            light_path.push(original_light_path[i]);
+        }
+        for i in 0..t {
+            eye_path.push(original_eye_path[i]);
+        }
+        if s == 1 {
+            light_path.push(sampled.unwrap());
+        } else if t == 1 {
+            eye_path.push(sampled.unwrap());
+        }
+        let mut qs: Option<&mut Vertex<'a>> = unsafe {
+            if s > 0 {
+                Some(&mut *(&mut light_path[s - 1] as *mut Vertex<'a>))
+            } else {
+                None
+            }
+        };
+        let mut qs_minus: Option<&mut Vertex<'a>> = unsafe {
+            if s > 1 {
+                Some(&mut *(&mut light_path[s - 2] as *mut Vertex<'a>))
+            } else {
+                None
+            }
+        };
+        let mut pt: Option<&mut Vertex<'a>> = unsafe {
+            if t > 0 {
+                Some(&mut *(&mut eye_path[t - 1] as *mut Vertex<'a>))
+            } else {
+                None
+            }
+        };
+        let mut pt_minus: Option<&mut Vertex<'a>> = unsafe {
+            if t > 1 {
+                Some(&mut *(&mut light_path[t - 2] as *mut Vertex<'a>))
+            } else {
+                None
+            }
+        };
+        // p0....pt-1 pt  qs qs-1 ...q0
+        if pt.is_some() {
+            // let pt = &mut *pt.as_mut().unwrap();
+            // let q
+            if let (Some(pt), Some(qs), Some(pt_minus)) =
+                (pt.as_mut(), qs.as_mut(), pt_minus.as_mut())
+            {
+                pt.base_mut().delta = false;
+                // pt-1 pt<- qs qs-1
+                pt.base_mut().pdf_rev = if s > 0 {
+                    let qs_minus = if s > 1 {
+                        Some(&light_path[s - 2])
+                    } else {
+                        None
+                    };
+                    qs.pdf(scene, qs_minus, pt)
+                } else {
+                    pt.pdf_light_origin(scene, pt_minus)
+                };
+            } else {
+                unreachable!();
+            }
+        }
+
+        if let Some(pt_minus) = &mut pt_minus {
+            if let (Some(pt), Some(qs)) =
+                (pt.as_mut(), qs.as_mut())
+            {
+                // pt-1 <- pt qs qs-1
+                pt.base_mut().pdf_rev = if s > 0 {
+                    pt.pdf(scene, Some(*qs), &*pt_minus)
+                } else {
+                    // pt-1 <- pt
+                    pt.pdf_light(scene, &*pt_minus)
+                };
+            } else {
+                unreachable!();
+            }
+        }
+
+        // if let Some(qs) = qs {
+        //     qs.base_mut().delta = false;
+        //     // pt-1 pt-> qs qs-1
+        //     qs.base_mut().pdf_rev =
+        //         pt.as_ref()
+        //             .unwrap()
+        //             .pdf(scene, pt_minus.as_ref().map(|r| &**r), &*qs);
+        // }
+        // if let Some(qs_minus) = qs_minus {
+        //     qs_minus.base_mut().pdf_rev =
+        //         qs.as_ref()
+        //             .unwrap()
+        //             .pdf(scene, pt.as_ref().map(|r| &**r), &*qs_minus);
+        // }
+        let sum_ri = 0.0;
+        1.0 / (1.0 + sum_ri)
+    }
     pub fn connect_paths<'a>(
         scene: &'a Scene,
         strat: ConnectionStrategy,
         light_path: &Path<'a>,
         eye_path: &Path<'a>,
         sampler: &mut dyn Sampler,
+        scratch: &mut Scratch<'a>,
     ) -> Spectrum {
         let s = strat.s;
         let t = strat.t;
@@ -2087,7 +2253,7 @@ mod bdpt {
                             light_sample.li / (light_sample.pdf * light_pdf),
                             0.0,
                         );
-                        v.base_mut().pdf_fwd = 1.0; //v.pdf_light_origin()
+                        v.base_mut().pdf_fwd = v.pdf_light_origin(scene, pt);
                         sampled = Some(v);
                     }
                     {
@@ -2121,7 +2287,7 @@ mod bdpt {
                 }
             }
         }
-        let mis_weight = 1.0 / (s + t - 1) as Float;
+        let mis_weight = bdpt::mis_weight(scene, strat, light_path, eye_path, sampled, scratch);
         l * mis_weight
     }
 }
@@ -2158,6 +2324,7 @@ impl Integrator for BDPT {
                     }
                 }
             }
+            let mut scratch = bdpt::Scratch::new();
             for _ in 0..self.spp {
                 bdpt::generate_camera_path(
                     scene,
@@ -2179,9 +2346,10 @@ impl Integrator for BDPT {
                                 s: s as usize,
                                 t: t as usize,
                             },
-                            &light_path,
-                            &camera_path,
+                            &mut light_path,
+                            &mut camera_path,
                             &mut sampler,
+                            &mut scratch,
                         );
                         if self.debug {
                             let idx = (t - 2) as usize * self.max_depth + s as usize;
