@@ -7,6 +7,7 @@ use std::{
     alloc::dealloc,
     cell::{RefCell, UnsafeCell},
     collections::{HashMap, LinkedList},
+    env,
     hash::Hasher,
     mem::MaybeUninit,
     ops::{Deref, Index, IndexMut, Mul},
@@ -489,7 +490,7 @@ pub trait Light: Sync + Send {
     fn sample_le(&self, u: &[Vec2; 2]) -> LightRaySample;
     fn sample_li(&self, u: &Vec2, p: &ReferencePoint) -> LightSample;
     fn pdf_le(&self, ray: &Ray) -> (Float, Float);
-    fn pdf_li(&self, wi: &Vec3, p: &ReferencePoint) -> Float;
+    fn pdf_li(&self, wi: &Vec3, p: &ReferencePoint) -> (Float, Float);
     fn le(&self, ray: &Ray) -> Spectrum;
     fn flags(&self) -> LightFlags;
     fn address(&self) -> usize; // ????
@@ -1177,15 +1178,15 @@ impl Light for PointLight {
     fn pdf_le(&self, ray: &Ray) -> (Float, Float) {
         (0.0, uniform_sphere_pdf())
     }
-    fn pdf_li(&self, wi: &Vec3, p: &ReferencePoint) -> Float {
-        0.0
+    fn pdf_li(&self, wi: &Vec3, p: &ReferencePoint) -> (Float, Float) {
+        (0.0, 0.0)
     }
     fn le(&self, _: &Ray) -> Spectrum {
         Spectrum::zero()
         // unimplemented!("point light cannot be hit")
     }
     fn flags(&self) -> LightFlags {
-        LightFlags::DELTA_DIRECTION | LightFlags::DELTA_POSITION
+        LightFlags::DELTA_POSITION
     }
     fn address(&self) -> usize {
         self as *const PointLight as usize
@@ -1738,7 +1739,7 @@ mod bdpt {
     use super::*;
 
     #[derive(Clone, Copy)]
-    struct VertexBase {
+    pub struct VertexBase {
         pdf_fwd: Float,
         pdf_rev: Float,
         delta: bool,
@@ -1802,7 +1803,7 @@ mod bdpt {
                     wo: glm::zero(),
                     pdf_fwd,
                     pdf_rev: 0.0,
-                    delta: (light.flags() | LightFlags::DELTA) != LightFlags::NONE,
+                    delta: false,
                     beta,
                     p,
                     n: Vec3::new(0.0, 0.0, 0.0), // ?????
@@ -1834,6 +1835,12 @@ mod bdpt {
             pdf_fwd = prev.convert_pdf_to_area(pdf_fwd, &v);
             v.base_mut().pdf_fwd = pdf_fwd;
             v
+        }
+        pub fn is_delta_light(&self) -> bool {
+            match self {
+                Self::Light(v) => (v.light.flags() | LightFlags::DELTA) != LightFlags::NONE,
+                _ => unreachable!(),
+            }
         }
         pub fn on_surface(&self) -> bool {
             match self {
@@ -1879,14 +1886,14 @@ mod bdpt {
                 Vertex::Light(v) => {
                     let light_pdf = scene.light_distr.pdf(v.light);
                     let wi = glm::normalize(&(next.p() - self.p()));
-                    let pdf = v.light.pdf_li(
+                    let (pdf_pos, _) = v.light.pdf_li(
                         &wi,
                         &ReferencePoint {
                             p: self.p(),
                             n: self.n(),
                         },
                     );
-                    self.convert_pdf_to_area(light_pdf * pdf, next)
+                    light_pdf * pdf_pos
                 }
                 _ => unreachable!(),
             }
@@ -1911,6 +1918,7 @@ mod bdpt {
                     let wi = glm::normalize(&(p2 - p));
                     v.bsdf.evaluate_pdf(&wo, &wi)
                 }
+                Vertex::Light(_) => self.pdf_light(scene, next),
                 _ => unreachable!(),
             };
             self.convert_pdf_to_area(pdf, next)
@@ -1944,7 +1952,7 @@ mod bdpt {
             let w = v2.p() - self.p();
             let inv_dist2 = 1.0 / glm::dot(&w, &w);
             if v2.on_surface() {
-                pdf *= glm::dot(&v2.n(), &(w * inv_dist2.sqrt()));
+                pdf *= glm::dot(&v2.n(), &(w * inv_dist2.sqrt())).abs();
             }
             pdf * inv_dist2
         }
@@ -1952,7 +1960,7 @@ mod bdpt {
             match self {
                 Vertex::Light(v) => {
                     let flags = v.light.flags();
-                    (flags | LightFlags::DELTA) == LightFlags::NONE
+                    (flags | LightFlags::DELTA_DIRECTION) == LightFlags::NONE
                 }
                 Vertex::Camera(_) => true,
                 Vertex::Surface(v) => true,
@@ -1973,6 +1981,7 @@ mod bdpt {
         _mode: TransportMode,
         path: &mut Path<'a>,
     ) {
+        assert!(pdf > 0.0);
         assert!(path.len() == 1);
         if max_depth == 0 {
             return;
@@ -2060,7 +2069,7 @@ mod bdpt {
         let le = sample.le;
         let beta = le / (sample.pdf_dir * sample.pdf_pos * light_pdf)
             * glm::dot(&sample.ray.d, &sample.n).abs();
-        let vertex = Vertex::create_light_vertex(light, sample.ray.o, le, light_pdf);
+        let vertex = Vertex::create_light_vertex(light, sample.ray.o, le, light_pdf * sample.pdf_pos);
         path.push(vertex);
         random_walk(
             scene,
@@ -2126,95 +2135,116 @@ mod bdpt {
         }
         for i in 0..t {
             eye_path.push(original_eye_path[i]);
+            // println!(
+            //     "{} {}",
+            //     original_eye_path[i].base().pdf_fwd,
+            //     original_eye_path[i].base().pdf_rev
+            // );
         }
         if s == 1 {
             light_path.push(sampled.unwrap());
         } else if t == 1 {
             eye_path.push(sampled.unwrap());
         }
-        let mut qs: Option<&mut Vertex<'a>> = unsafe {
-            if s > 0 {
-                Some(&mut *(&mut light_path[s - 1] as *mut Vertex<'a>))
+        // update vertices
+        {
+            let qs = if s > 0 {
+                &mut light_path[s - 1] as *mut Vertex<'a>
             } else {
-                None
-            }
-        };
-        let mut qs_minus: Option<&mut Vertex<'a>> = unsafe {
-            if s > 1 {
-                Some(&mut *(&mut light_path[s - 2] as *mut Vertex<'a>))
+                std::ptr::null_mut()
+            };
+            let qs_minus = if s > 1 {
+                &mut light_path[s - 2] as *mut Vertex<'a>
             } else {
-                None
-            }
-        };
-        let mut pt: Option<&mut Vertex<'a>> = unsafe {
-            if t > 0 {
-                Some(&mut *(&mut eye_path[t - 1] as *mut Vertex<'a>))
+                std::ptr::null_mut()
+            };
+            let pt = if t > 0 {
+                &mut eye_path[t - 1] as *mut Vertex<'a>
             } else {
-                None
-            }
-        };
-        let mut pt_minus: Option<&mut Vertex<'a>> = unsafe {
-            if t > 1 {
-                Some(&mut *(&mut light_path[t - 2] as *mut Vertex<'a>))
+                std::ptr::null_mut()
+            };
+            let pt_minus = if t > 1 {
+                &mut eye_path[t - 2] as *mut Vertex<'a>
             } else {
-                None
-            }
-        };
-        // p0....pt-1 pt  qs qs-1 ...q0
-        if pt.is_some() {
-            // let pt = &mut *pt.as_mut().unwrap();
-            // let q
-            if let (Some(pt), Some(qs), Some(pt_minus)) =
-                (pt.as_mut(), qs.as_mut(), pt_minus.as_mut())
-            {
+                std::ptr::null_mut()
+            };
+            // p0....pt-1 pt  qs qs-1 ...q0
+            if !pt.is_null() {
+                let pt = unsafe { pt.as_mut().unwrap() };
+                let qs_minus = unsafe { qs_minus.as_ref() };
+                let qs = unsafe { qs.as_ref() };
+                let pt_minus = unsafe { &*pt_minus };
                 pt.base_mut().delta = false;
                 // pt-1 pt<- qs qs-1
                 pt.base_mut().pdf_rev = if s > 0 {
-                    let qs_minus = if s > 1 {
-                        Some(&light_path[s - 2])
-                    } else {
-                        None
-                    };
-                    qs.pdf(scene, qs_minus, pt)
+                    qs.unwrap().pdf(scene, qs_minus, pt)
                 } else {
                     pt.pdf_light_origin(scene, pt_minus)
                 };
-            } else {
-                unreachable!();
             }
-        }
 
-        if let Some(pt_minus) = &mut pt_minus {
-            if let (Some(pt), Some(qs)) =
-                (pt.as_mut(), qs.as_mut())
-            {
+            if !pt_minus.is_null() {
+                let pt = unsafe { pt.as_mut().unwrap() };
+                let qs = unsafe { qs.as_ref() };
+                let pt_minus = unsafe { pt_minus.as_ref().unwrap() };
                 // pt-1 <- pt qs qs-1
                 pt.base_mut().pdf_rev = if s > 0 {
-                    pt.pdf(scene, Some(*qs), &*pt_minus)
+                    pt.pdf(scene, qs, pt_minus)
                 } else {
                     // pt-1 <- pt
-                    pt.pdf_light(scene, &*pt_minus)
+                    pt.pdf_light(scene, pt_minus)
                 };
-            } else {
-                unreachable!();
+            }
+
+            if !qs.is_null() {
+                let qs = unsafe { qs.as_mut().unwrap() };
+                let pt = unsafe { pt.as_mut().unwrap() };
+                let pt_minus = unsafe { pt_minus.as_ref() };
+                qs.base_mut().delta = false;
+                // pt-1 pt-> qs qs-1
+                qs.base_mut().pdf_rev = pt.pdf(scene, pt_minus, qs);
+            }
+            if !qs_minus.is_null() {
+                let qs = unsafe { qs.as_mut().unwrap() };
+                let pt = unsafe { pt.as_ref() };
+                let qs_minus = unsafe { qs_minus.as_mut().unwrap() };
+                qs_minus.base_mut().pdf_rev = qs.pdf(scene, pt, qs_minus);
             }
         }
 
-        // if let Some(qs) = qs {
-        //     qs.base_mut().delta = false;
-        //     // pt-1 pt-> qs qs-1
-        //     qs.base_mut().pdf_rev =
-        //         pt.as_ref()
-        //             .unwrap()
-        //             .pdf(scene, pt_minus.as_ref().map(|r| &**r), &*qs);
-        // }
-        // if let Some(qs_minus) = qs_minus {
-        //     qs_minus.base_mut().pdf_rev =
-        //         qs.as_ref()
-        //             .unwrap()
-        //             .pdf(scene, pt.as_ref().map(|r| &**r), &*qs_minus);
-        // }
-        let sum_ri = 0.0;
+        let mut sum_ri = 0.0;
+        let remap = |x| {
+            if x == 0.0 {
+                1.0
+            } else {
+                x
+            }
+        };
+        {
+            // camera path
+            let mut ri = 1.0;
+            for i in (2..=t - 1).rev() {
+                ri *= remap(eye_path[i].base().pdf_rev) / remap(eye_path[i].base().pdf_fwd);
+                if !eye_path[i].base().delta {
+                    sum_ri += ri;
+                }
+            }
+        }
+        {
+            let mut ri = 1.0;
+            for i in (0..=s - 1).rev() {
+                ri *= remap(light_path[i].base().pdf_rev) / remap(light_path[i].base().pdf_fwd);
+                let delta_light = if i > 0 {
+                    light_path[i - 1].base().delta
+                } else {
+                    light_path[0].is_delta_light()
+                };
+                if !light_path[i].base().delta && !delta_light {
+                    sum_ri += ri;
+                }
+            }
+        }
+        // println!("{}", 1.0 / (1.0 + sum_ri));
         1.0 / (1.0 + sum_ri)
     }
     pub fn connect_paths<'a>(
@@ -2287,7 +2317,11 @@ mod bdpt {
                 }
             }
         }
-        let mis_weight = bdpt::mis_weight(scene, strat, light_path, eye_path, sampled, scratch);
+        let mis_weight = if l.is_black() {
+            0.0
+        } else {
+            bdpt::mis_weight(scene, strat, light_path, eye_path, sampled, scratch)
+        };
         l * mis_weight
     }
 }
@@ -2303,11 +2337,12 @@ impl Integrator for BDPT {
         let npixels = (scene.camera.resolution().x * scene.camera.resolution().y) as usize;
         let film = RwLock::new(Film::new(&scene.camera.resolution()));
         let mut pyramid = Vec::new();
-        for t in 2..=self.max_depth {
-            for s in 0..self.max_depth {
+        for _t in 2..=self.max_depth + 2 {
+            for _s in 0..self.max_depth + 2 {
                 pyramid.push(RwLock::new(Film::new(&scene.camera.resolution())));
             }
         }
+        let get_index = |s, t| (t - 2) as usize * (3 + self.max_depth) + s as usize;
         parallel_for(npixels, 256, |id| {
             let mut sampler = PCGSampler { rng: PCG::new(id) };
             let x = (id as u32) % scene.camera.resolution().x;
@@ -2318,8 +2353,8 @@ impl Integrator for BDPT {
             let mut light_path = vec![];
             let mut debug_acc = vec![];
             if self.debug {
-                for _t in 2..=self.max_depth {
-                    for _s in 0..self.max_depth {
+                for _t in 2..=self.max_depth + 2 {
+                    for _s in 0..=self.max_depth + 2 {
                         debug_acc.push(Spectrum::zero());
                     }
                 }
@@ -2330,12 +2365,12 @@ impl Integrator for BDPT {
                     scene,
                     &pixel,
                     &mut sampler,
-                    self.max_depth,
+                    self.max_depth + 2,
                     &mut camera_path,
                 );
-                bdpt::generate_light_path(scene, &mut sampler, self.max_depth, &mut light_path);
+                bdpt::generate_light_path(scene, &mut sampler, self.max_depth + 1, &mut light_path);
                 for t in 2..=camera_path.len() as isize {
-                    for s in 0..light_path.len() as isize {
+                    for s in 0..=light_path.len() as isize {
                         let depth = s + t - 2;
                         if (s == 1 && t == 1) || depth < 0 || depth > self.max_depth as isize {
                             continue;
@@ -2352,8 +2387,7 @@ impl Integrator for BDPT {
                             &mut scratch,
                         );
                         if self.debug {
-                            let idx = (t - 2) as usize * self.max_depth + s as usize;
-                            debug_acc[idx] += li;
+                            debug_acc[get_index(s, t)] += li;
                         }
                         acc_li += li;
                     }
@@ -2365,17 +2399,17 @@ impl Integrator for BDPT {
                 film.add_sample(&glm::UVec2::new(x, y), &acc_li, 1.0);
             }
             if self.debug {
-                for t in 2..=self.max_depth as isize {
-                    for s in 0..self.max_depth as isize {
+                for t in 2..=(self.max_depth + 2) as isize {
+                    for s in 0..=(self.max_depth + 2) as isize {
                         let depth = s + t - 2;
                         if (s == 1 && t == 1) || depth < 0 || depth > self.max_depth as isize {
                             continue;
                         }
-                        let idx = (t - 2) as usize * self.max_depth + s as usize;
+                        let idx = get_index(s, t);
                         let film = &mut pyramid[idx].write().unwrap();
                         film.add_sample(
                             &glm::UVec2::new(x, y),
-                            &(debug_acc[idx] / (self.spp as Float) * (s + t - 1) as Float),
+                            &(debug_acc[idx] / (self.spp as Float) as Float),
                             1.0,
                         );
                     }
@@ -2383,16 +2417,17 @@ impl Integrator for BDPT {
             }
         });
         if self.debug {
-            for t in 2..=self.max_depth as isize {
-                for s in 0..self.max_depth as isize {
+            for t in 2..=(self.max_depth + 2) as isize {
+                for s in 0..=(self.max_depth + 2) as isize {
                     let depth = s + t - 2;
                     if (s == 1 && t == 1) || depth < 0 || depth > self.max_depth as isize {
                         continue;
                     }
-                    let idx = (t - 2) as usize * self.max_depth + s as usize;
+                    let idx = get_index(s, t);
                     let film = &pyramid[idx].read().unwrap();
                     let img = film.to_rgb_image();
-                    img.save(format!("bdpt-s{}-t{}.png", s, t)).unwrap();
+                    img.save(format!("bdpt-d{}-s{}-t{}.png", depth, s, t))
+                        .unwrap();
                 }
             }
         }
@@ -2465,15 +2500,15 @@ fn main() {
         lights: lights.clone(),
         light_distr: Arc::new(UniformLightDistribution::new(lights.clone())),
     };
-    let mut integrator = PathTracer {
+    // let mut integrator = PathTracer {
+    //     spp: 32,
+    //     max_depth: 3,
+    // };
+    let mut integrator = BDPT {
         spp: 32,
         max_depth: 3,
+        debug: false,
     };
-    // let mut integrator = BDPT {
-    //     spp: 16,
-    //     max_depth: 3,
-    //     debug: true,
-    // };
     // let mut integrator = SPPM {
     //     initial_radius: 0.1,
     //     iterations: 64,
@@ -2482,5 +2517,5 @@ fn main() {
     // };
     let film = integrator.render(&scene);
     let image = film.to_rgb_image();
-    image.save("out-pt.png").unwrap();
+    image.save("out-bdpt.png").unwrap();
 }
