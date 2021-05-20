@@ -1453,7 +1453,6 @@ impl<'a> VisiblePointGrid<'a> {
         uvec3(q.x as u32, q.y as u32, q.z as u32)
     }
     pub fn insert(&self, pixel: &'a SPPMPixel<'a>) {
-        // println!("fuck");
         let p = pixel.vp.as_ref().unwrap().p;
         let radius = pixel.radius;
         let pmin = self.to_grid(p - vec3(radius, radius, radius));
@@ -1669,9 +1668,6 @@ impl Integrator for SPPM {
                             let h = grid.hash(&grid.to_grid(p));
                             let mut ap = grid.grid[h].0.load(Ordering::Relaxed);
                             while !ap.is_null() {
-                                // if depth == 1{
-                                // println!("fuck");
-                                // }
                                 let node = unsafe { &*ap };
                                 let pixel = node.pixel;
                                 let wi = -ray.d;
@@ -2815,12 +2811,12 @@ mod nn {
    }
     macro_rules! create_mlp_helper {
     ($opt_v:expr, $act:ty, $opt:ty, $dim1:expr, $dim2:expr)=>{
-        mlp::Linear::<$opt, $dim1, $dim2>::new($opt_v)
+        crate::nn::mlp::Linear::<$opt, $dim1, $dim2>::new($opt_v)
     };
     ($opt_v:expr,$act:ty, $opt:ty,  $dim1:expr,$dim2:expr, $($rest:expr), *)=>{
 
     CombineModules{
-               a: Layer::<$act, $opt, $dim1, $dim2>::new($opt_v),
+               a: crate::nn::mlp::Layer::<$act, $opt, $dim1, $dim2>::new($opt_v),
                b:create_mlp_helper!($opt_v, $act, $opt, $dim2, $($rest), *)
            }
         };
@@ -2836,45 +2832,57 @@ mod nrc {
     struct RadianceCache {}
 }
 
-fn main() {
-    // #[macro_use(nn::mlp)]
-    use nn::mlp::CombineModules;
-    // use nn::mlp
-    use nn::*;
-    let opt = SGD { learning_rate: 0.1 };
-    // let layer0: Layer<Linear, SGD, 2, 4> = Layer::new(opt.clone());
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_mlp() {
+        // #[macro_use(nn::mlp)]
+        use super::nn::mlp::CombineModules;
+        // use nn::mlp
+        use super::nn::*;
+        use rand::Rng;
+        use nalgebra as na;
+        let opt = SGD { learning_rate: 0.1 };
+        // let layer0: Layer<Linear, SGD, 2, 4> = Layer::new(opt.clone());
 
-    // let layer1: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
-    // let layer1: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
-    // let layer3: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
-    // let layer4: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
-    // let layer5: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
-    // let layer6: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
-    // let layer7: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
+        // let layer1: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
+        // let layer1: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
+        // let layer3: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
+        // let layer4: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
+        // let layer5: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
+        // let layer6: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
+        // let layer7: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
 
-    // let mut net = Model::new(sequential!(layer0, layer1));
-    let mut net = create_mlp!(opt, Relu, SGD, 1, 8, 1);
+        // let mut net = Model::new(sequential!(layer0, layer1));
+        let mut net = create_mlp!(opt, Relu, SGD, 1, 8, 1);
 
-    fn f(x: &na::SVector<f32, 1>) -> na::SVector<f32, 1> {
-        // na::SVector::<f32, 1>::new(x[0] + x[1])
-        na::SVector::<f32, 1>::new(x[0].sin())
-    }
-    let mut rng = rand::thread_rng();
-    for iter in 0..100000 {
-        let x = na::zero::<na::SVector<f32, 1>>().map(|_| rng.gen::<f32>() * 2.0 - 1.0);
-        let y = net.infer(&x);
-        let loss = net.train(&x, f(&x));
-        if iter % 1000 == 0 {
-            // println!("training on {} {}; {}",&x, f(&x), y);
-            println!("{} {}", iter, loss);
+        fn f(x: &na::SVector<f32, 1>) -> na::SVector<f32, 1> {
+            // na::SVector::<f32, 1>::new(x[0] + x[1])
+            na::SVector::<f32, 1>::new(x[0].sin())
         }
+        let mut rng = rand::thread_rng();
+        for iter in 0..100000 {
+            let x = na::zero::<na::SVector<f32, 1>>().map(|_| rng.gen::<f32>() * 2.0 - 1.0);
+            // let y = net.infer(&x);
+            let loss = net.train(&x, f(&x));
+            // if iter % 1000 == 0 {
+            //     // println!("training on {} {}; {}",&x, f(&x), y);
+            //     println!("{} {}", iter, loss);
+            // }
+        }
+        {
+            let x = na::SVector::<f32, 1>::new(0.3f32);
+            let y = net.infer(&na::SVector::<f32, 1>::new(0.3f32))[0];
+            let gt = f(&na::SVector::<f32, 1>::new(0.3f32))[0];
+            assert!((y - gt).abs() < 0.01);
+        }
+        // println!("{}", net)
+        // println!("{} {}", net.infer(& na::SVector::<f32, 1>::new(0.3f32)), f(& na::SVector::<f32, 1>::new(0.3f32)));
+        // println!("{} {}", net.m.a.linear.weights, net.m.a.linear.bias);
+        // println!("{} {}", net.m.b.weights, net.m.b.bias);
     }
-    // println!("{}", net)
-    println!("{} {}", net.infer(& na::SVector::<f32, 1>::new(0.3f32)), f(& na::SVector::<f32, 1>::new(0.3f32)));
-    // println!("{} {}", net.m.a.linear.weights, net.m.a.linear.bias);
-    // println!("{} {}", net.m.b.weights, net.m.b.bias);
 }
-fn main0() {
+fn main() {
     // rayon::ThreadPoolBuilder::new()
     //     .num_threads(1)
     //     .build_global()
