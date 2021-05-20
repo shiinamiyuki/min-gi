@@ -1,5 +1,8 @@
+use glm::vec2;
+use glm::vec3;
 pub use nalgebra as na;
 pub use nalgebra_glm as glm;
+use rand::Rng;
 use rayon::prelude::*;
 #[macro_use]
 extern crate bitflags;
@@ -18,12 +21,20 @@ use std::{
     usize,
 };
 
+use crate::nn::{mlp::Layer, Relu, SGD};
+
 type Float = f64;
 type Vec3 = glm::TVec3<Float>;
 type Vec2 = glm::TVec2<Float>;
 type Mat4 = glm::TMat4<Float>;
 type Mat3 = glm::TMat3<Float>;
 
+pub fn uvec2(x: u32, y: u32) -> glm::UVec2 {
+    glm::UVec2::new(x, y)
+}
+pub fn uvec3(x: u32, y: u32, z: u32) -> glm::UVec3 {
+    glm::UVec3::new(x, y, z)
+}
 pub struct AtomicFloat {
     bits: AtomicU32,
 }
@@ -114,8 +125,8 @@ impl Default for Bound3<Float> {
     fn default() -> Self {
         let inf = Float::INFINITY;
         Self {
-            min: Vec3::new(inf, inf, inf),
-            max: Vec3::new(-inf, -inf, -inf),
+            min: vec3(inf, inf, inf),
+            max: vec3(-inf, -inf, -inf),
         }
     }
 }
@@ -144,7 +155,7 @@ impl Spectrum {
             }
         };
         Spectrum {
-            samples: Vec3::new(f(rgb.x), f(rgb.y), f(rgb.z)),
+            samples: vec3(f(rgb.x), f(rgb.y), f(rgb.z)),
         }
     }
     pub fn to_srgb(&self) -> Vec3 {
@@ -156,7 +167,7 @@ impl Spectrum {
             }
         };
 
-        Vec3::new(f(self.samples.x), f(self.samples.y), f(self.samples.z))
+        vec3(f(self.samples.x), f(self.samples.y), f(self.samples.z))
     }
     pub fn zero() -> Spectrum {
         Self {
@@ -165,7 +176,7 @@ impl Spectrum {
     }
     pub fn one() -> Spectrum {
         Self {
-            samples: Vec3::new(1.0, 1.0, 1.0),
+            samples: vec3(1.0, 1.0, 1.0),
         }
     }
 
@@ -277,9 +288,9 @@ pub struct Frame {
 impl Frame {
     pub fn from_normal(normal: &Vec3) -> Self {
         let tangent = if normal.x.abs() > normal.y.abs() {
-            glm::normalize(&Vec3::new(-normal.z, 0.0, normal.x))
+            glm::normalize(&vec3(-normal.z, 0.0, normal.x))
         } else {
-            glm::normalize(&Vec3::new(0.0, normal.z, -normal.y))
+            glm::normalize(&vec3(0.0, normal.z, -normal.y))
         };
         Self {
             N: *normal,
@@ -288,7 +299,7 @@ impl Frame {
         }
     }
     pub fn to_local(&self, v: &Vec3) -> Vec3 {
-        Vec3::new(
+        vec3(
             glm::dot(&v, &self.T),
             glm::dot(&v, &self.N),
             glm::dot(&v, &self.B),
@@ -333,7 +344,7 @@ impl Transform {
     }
     pub fn transform_point(&self, p: &Vec3) -> Vec3 {
         let q = self.m4 * glm::TVec4::<Float>::new(p.x, p.y, p.z, 1.0);
-        Vec3::new(q.x, q.y, q.z) / q.w
+        vec3(q.x, q.y, q.z) / q.w
     }
     pub fn transform_vector(&self, v: &Vec3) -> Vec3 {
         self.m3 * v
@@ -366,9 +377,9 @@ const FRAC_1_PI: Float = std::f64::consts::FRAC_1_PI as Float;
 const FRAC_PI_2: Float = std::f64::consts::FRAC_PI_2 as Float;
 const FRAC_PI_4: Float = std::f64::consts::FRAC_PI_4 as Float;
 pub fn concentric_sample_disk(u: &Vec2) -> Vec2 {
-    let u_offset: Vec2 = 2.0 * u - Vec2::new(1.0, 1.0);
+    let u_offset: Vec2 = 2.0 * u - vec2(1.0, 1.0);
     if u_offset.x == 0.0 && u_offset.y == 0.0 {
-        return Vec2::new(0.0, 0.0);
+        return vec2(0.0, 0.0);
     }
 
     let (theta, r) = {
@@ -382,19 +393,19 @@ pub fn concentric_sample_disk(u: &Vec2) -> Vec2 {
             (theta, r)
         }
     };
-    r * Vec2::new(theta.cos(), theta.sin())
+    r * vec2(theta.cos(), theta.sin())
 }
 pub fn consine_hemisphere_sampling(u: &Vec2) -> Vec3 {
     let uv = concentric_sample_disk(&u);
     let r = glm::dot(&uv, &uv);
     let h = (1.0 - r).sqrt();
-    Vec3::new(uv.x, h, uv.y)
+    vec3(uv.x, h, uv.y)
 }
 pub fn uniform_sphere_sampling(u: &Vec2) -> Vec3 {
     let z = 1.0 - 2.0 * u[0];
     let r = (1.0 - z * z).max(0.0).sqrt();
     let phi = 2.0 * PI * u[1];
-    Vec3::new(r * phi.cos(), z, r * phi.sin())
+    vec3(r * phi.cos(), z, r * phi.sin())
 }
 pub fn uniform_sphere_pdf() -> Float {
     1.0 / (4.0 * PI)
@@ -446,7 +457,7 @@ pub trait Shape: Sync + Send {
 pub trait Sampler: Sync + Send {
     fn next1d(&mut self) -> Float;
     fn next2d(&mut self) -> Vec2 {
-        Vec2::new(self.next1d(), self.next1d())
+        vec2(self.next1d(), self.next1d())
     }
 }
 
@@ -579,7 +590,7 @@ impl Film {
     }
     pub fn to_rgb_image(&self) -> image::RgbImage {
         let image = image::ImageBuffer::from_fn(self.resolution.x, self.resolution.y, |x, y| {
-            let pixel = self.get_pixel(&glm::UVec2::new(x, y));
+            let pixel = self.get_pixel(&uvec2(x, y));
             let value = pixel.intensity * (1.0 / pixel.weight);
             let srgb = value.to_srgb() * 255.0;
             image::Rgb([srgb.x as u8, srgb.y as u8, srgb.z as u8])
@@ -788,7 +799,7 @@ mod bvh {
             let mut sp = 0;
             let mut p = Some(&self.nodes[0]);
             let mut ray = *original_ray;
-            let invd: Vec3 = Vec3::new(1.0, 1.0, 1.0).component_div(&ray.d);
+            let invd: Vec3 = vec3(1.0, 1.0, 1.0).component_div(&ray.d);
             let mut isct = None;
             while p.is_some() {
                 let node = p.unwrap();
@@ -831,7 +842,7 @@ mod bvh {
             let mut sp = 0;
             let mut p = Some(&self.nodes[0]);
             let mut ray = *original_ray;
-            let invd: Vec3 = Vec3::new(1.0, 1.0, 1.0).component_div(&ray.d);
+            let invd: Vec3 = vec3(1.0, 1.0, 1.0).component_div(&ray.d);
             while p.is_some() {
                 let node = p.unwrap();
                 let t = Self::intersect_aabb(&node.aabb, &ray, &invd);
@@ -933,7 +944,7 @@ impl Shape for Sphere {
             return Some(Intersection {
                 shape: self,
                 t: t1,
-                uv: Vec2::new(0.0, 0.0),
+                uv: vec2(0.0, 0.0),
                 ng: n,
                 ns: n,
             });
@@ -945,7 +956,7 @@ impl Shape for Sphere {
             return Some(Intersection {
                 shape: self,
                 t: t2,
-                uv: Vec2::new(0.0, 0.0),
+                uv: vec2(0.0, 0.0),
                 ng: n,
                 ns: n,
             });
@@ -976,11 +987,18 @@ impl Shape for Sphere {
     }
     fn aabb(&self) -> Bounds3f {
         Bounds3f {
-            min: self.center - Vec3::new(self.radius, self.radius, self.radius),
-            max: self.center + Vec3::new(self.radius, self.radius, self.radius),
+            min: self.center - vec3(self.radius, self.radius, self.radius),
+            max: self.center + vec3(self.radius, self.radius, self.radius),
         }
     }
 }
+
+#[derive(Clone)]
+struct TriangleMesh {
+    vertices: Vec<Vec3>,
+    indices: Vec<u32>,
+}
+
 struct PerspectiveCamera {
     resolution: glm::UVec2,
     c2w: Transform,
@@ -993,28 +1011,22 @@ struct PerspectiveCamera {
 impl PerspectiveCamera {
     fn new(resolution: &glm::UVec2, transform: &Transform, fov: Float) -> Self {
         let mut m = glm::identity();
-        let fres = Vec2::new(resolution.x as Float, resolution.y as Float);
-        m = glm::scale(
-            &glm::identity(),
-            &Vec3::new(1.0 / fres.x, 1.0 / fres.y, 1.0),
-        ) * m;
-        m = glm::scale(&glm::identity(), &Vec3::new(2.0, 2.0, 1.0)) * m;
-        m = glm::translate(&glm::identity(), &Vec3::new(-1.0, -1.0, 0.0)) * m;
-        m = glm::scale(&glm::identity(), &Vec3::new(1.0, -1.0, 1.0)) * m;
+        let fres = vec2(resolution.x as Float, resolution.y as Float);
+        m = glm::scale(&glm::identity(), &vec3(1.0 / fres.x, 1.0 / fres.y, 1.0)) * m;
+        m = glm::scale(&glm::identity(), &vec3(2.0, 2.0, 1.0)) * m;
+        m = glm::translate(&glm::identity(), &vec3(-1.0, -1.0, 0.0)) * m;
+        m = glm::scale(&glm::identity(), &vec3(1.0, -1.0, 1.0)) * m;
         let s = (fov / 2.0).atan();
         if resolution.x > resolution.y {
-            m = glm::scale(&glm::identity(), &Vec3::new(s, s * fres.y / fres.x, 1.0)) * m;
+            m = glm::scale(&glm::identity(), &vec3(s, s * fres.y / fres.x, 1.0)) * m;
         } else {
-            m = glm::scale(&glm::identity(), &Vec3::new(s * fres.x / fres.y, s, 1.0)) * m;
+            m = glm::scale(&glm::identity(), &vec3(s * fres.x / fres.y, s, 1.0)) * m;
         }
         let r2c = Transform::from_matrix(&m);
         let a = {
-            let p_min = r2c.transform_point(&Vec3::new(0.0, 0.0, 0.0));
-            let p_max = r2c.transform_point(&Vec3::new(
-                resolution.x as Float,
-                resolution.y as Float,
-                0.0,
-            ));
+            let p_min = r2c.transform_point(&vec3(0.0, 0.0, 0.0));
+            let p_max =
+                r2c.transform_point(&vec3(resolution.x as Float, resolution.y as Float, 0.0));
             ((p_max.x - p_min.x) * (p_max.y * p_min.y)).abs()
         };
         Self {
@@ -1034,14 +1046,12 @@ impl Camera for PerspectiveCamera {
         let fpixel: Vec2 = glm::convert(*pixel);
         let p_film = sampler.next2d() + fpixel;
         let p = {
-            let v = self
-                .r2c
-                .transform_point(&Vec3::new(p_film.x, p_film.y, 0.0));
-            Vec2::new(v.x, v.y)
+            let v = self.r2c.transform_point(&vec3(p_film.x, p_film.y, 0.0));
+            vec2(v.x, v.y)
         };
         let mut ray = Ray::spawn(
             &glm::zero(),
-            &glm::normalize(&(Vec3::new(p.x, p.y, 0.0) - Vec3::new(0.0, 0.0, 1.0))),
+            &glm::normalize(&(vec3(p.x, p.y, 0.0) - vec3(0.0, 0.0, 1.0))),
         );
         // ray.tmin = (1.0 / ray.d.z).abs();
         ray.o = self.c2w.transform_point(&ray.o);
@@ -1052,10 +1062,7 @@ impl Camera for PerspectiveCamera {
         self.resolution
     }
     fn we(&self, ray: &Ray) -> (Option<glm::UVec2>, Spectrum) {
-        let cos_theta = glm::dot(
-            &ray.d,
-            &self.c2w.transform_vector(&Vec3::new(0.0, 0.0, -1.0)),
-        );
+        let cos_theta = glm::dot(&ray.d, &self.c2w.transform_vector(&vec3(0.0, 0.0, -1.0)));
         if cos_theta <= 0.0 {
             return (None, Spectrum::zero());
         }
@@ -1073,15 +1080,12 @@ impl Camera for PerspectiveCamera {
         let lens_area = 1.0;
         let cos2_theta = cos_theta * cos_theta;
         (
-            Some(glm::UVec2::new(p_raster.x as u32, p_raster.y as u32)),
+            Some(uvec2(p_raster.x as u32, p_raster.y as u32)),
             Spectrum::one() / (self.a * lens_area * cos2_theta * cos2_theta),
         )
     }
     fn pdf_we(&self, ray: &Ray) -> (Float, Float) {
-        let cos_theta = glm::dot(
-            &ray.d,
-            &self.c2w.transform_vector(&Vec3::new(0.0, 0.0, -1.0)),
-        );
+        let cos_theta = glm::dot(&ray.d, &self.c2w.transform_vector(&vec3(0.0, 0.0, -1.0)));
         if cos_theta <= 0.0 {
             return (0.0, 0.0);
         }
@@ -1101,7 +1105,7 @@ impl Camera for PerspectiveCamera {
         (1.0 / lens_area, self.a * cos2_theta * cos_theta)
     }
     fn n(&self) -> Vec3 {
-        self.c2w.transform_vector(&Vec3::new(0.0, 0.0, -1.0))
+        self.c2w.transform_vector(&vec3(0.0, 0.0, -1.0))
     }
 }
 struct NullBSDF {}
@@ -1216,7 +1220,7 @@ impl BSDF for DiffuseBSDF {
             if Frame::same_hemisphere(&w, &wo) {
                 w
             } else {
-                Vec3::new(w.x, -w.y, w.z)
+                vec3(w.x, -w.y, w.z)
             }
         };
         Some(BSDFSample {
@@ -1249,7 +1253,7 @@ impl Integrator for RTAO {
             let mut sampler = PCGSampler { rng: PCG::new(id) };
             let x = (id as u32) % scene.camera.resolution().x;
             let y = (id as u32) / scene.camera.resolution().x;
-            let pixel = glm::UVec2::new(x, y);
+            let pixel = uvec2(x, y);
             let mut acc_li = Spectrum::zero();
             for _ in 0..self.spp {
                 let (mut ray, ray_weight) = scene.camera.generate_ray(&pixel, &mut sampler);
@@ -1264,7 +1268,7 @@ impl Integrator for RTAO {
                             frame.to_world(&w)
                         };
                         // li = Spectrum {
-                        //     samples: Vec3::new(1.0,1.0,1.0) * glm::dot(&wi, &Vec3::new(0.2, 0.8, 0.0)),
+                        //     samples: vec3(1.0,1.0,1.0) * glm::dot(&wi, &vec3(0.2, 0.8, 0.0)),
                         // };
 
                         // li = Spectrum{samples:wi};
@@ -1280,7 +1284,7 @@ impl Integrator for RTAO {
             acc_li = acc_li / (self.spp as Float);
             {
                 let film = &mut film.write().unwrap();
-                film.add_sample(&glm::UVec2::new(x, y), &acc_li, 1.0);
+                film.add_sample(&uvec2(x, y), &acc_li, 1.0);
             }
         });
         film.into_inner().unwrap()
@@ -1299,7 +1303,7 @@ impl Integrator for PathTracer {
             let mut sampler = PCGSampler { rng: PCG::new(id) };
             let x = (id as u32) % scene.camera.resolution().x;
             let y = (id as u32) / scene.camera.resolution().x;
-            let pixel = glm::UVec2::new(x, y);
+            let pixel = uvec2(x, y);
             let mut acc_li = Spectrum::zero();
             for _ in 0..self.spp {
                 let (mut ray, ray_weight) = scene.camera.generate_ray(&pixel, &mut sampler);
@@ -1358,7 +1362,7 @@ impl Integrator for PathTracer {
             acc_li = acc_li / (self.spp as Float);
             {
                 let film = &mut film.write().unwrap();
-                film.add_sample(&glm::UVec2::new(x, y), &acc_li, 1.0);
+                film.add_sample(&uvec2(x, y), &acc_li, 1.0);
             }
         });
         film.into_inner().unwrap()
@@ -1441,24 +1445,24 @@ impl<'a> VisiblePointGrid<'a> {
         p = glm::min2(&self.bound.max, &p);
         p = glm::max2(&self.bound.min, &p);
         let mut q = self.bound.offset(&p);
-        q = q.component_mul(&Vec3::new(
+        q = q.component_mul(&vec3(
             self.grid_res[0] as Float,
             self.grid_res[1] as Float,
             self.grid_res[2] as Float,
         ));
-        glm::UVec3::new(q.x as u32, q.y as u32, q.z as u32)
+        uvec3(q.x as u32, q.y as u32, q.z as u32)
     }
     pub fn insert(&self, pixel: &'a SPPMPixel<'a>) {
         // println!("fuck");
         let p = pixel.vp.as_ref().unwrap().p;
         let radius = pixel.radius;
-        let pmin = self.to_grid(p - Vec3::new(radius, radius, radius));
-        let pmax = self.to_grid(p + Vec3::new(radius, radius, radius));
+        let pmin = self.to_grid(p - vec3(radius, radius, radius));
+        let pmax = self.to_grid(p + vec3(radius, radius, radius));
         // println!("{:?} {:?}", pmin,pmax);
         for z in pmin.z..=pmax.z {
             for y in pmin.y..=pmax.y {
                 for x in pmin.x..=pmax.x {
-                    let h = self.hash(&glm::UVec3::new(x, y, z));
+                    let h = self.hash(&uvec3(x, y, z));
 
                     self.insert_at(h, pixel);
                 }
@@ -1571,7 +1575,7 @@ impl Integrator for SPPM {
 
                 let x = (id as u32) % scene.camera.resolution().x;
                 let y = (id as u32) / scene.camera.resolution().x;
-                let pixel = glm::UVec2::new(x, y);
+                let pixel = uvec2(x, y);
 
                 let sampler = unsafe { p_samplers.offset(id as isize).as_mut().unwrap().as_mut() };
                 let (mut ray, ray_weight) = scene.camera.generate_ray(&pixel, sampler);
@@ -1603,8 +1607,8 @@ impl Integrator for SPPM {
                 for pixel in &pixels {
                     if let Some(vp) = &pixel.vp {
                         let p_bound = Bounds3f {
-                            min: vp.p - Vec3::new(pixel.radius, pixel.radius, pixel.radius),
-                            max: vp.p + Vec3::new(pixel.radius, pixel.radius, pixel.radius),
+                            min: vp.p - vec3(pixel.radius, pixel.radius, pixel.radius),
+                            max: vp.p + vec3(pixel.radius, pixel.radius, pixel.radius),
                         };
                         bound.insert_box(&p_bound);
                         max_radius = max_radius.max(pixel.radius);
@@ -1722,7 +1726,7 @@ impl Integrator for SPPM {
         parallel_for(npixels, 256, |id| {
             let x = (id as u32) % scene.camera.resolution().x;
             let y = (id as u32) / scene.camera.resolution().x;
-            let pixel = glm::UVec2::new(x, y);
+            let pixel = uvec2(x, y);
             let p = unsafe { p_pixels.offset(id as isize).as_ref().unwrap() };
             let l =
                 p.tau / ((self.iterations * self.n_photons) as Float * PI * p.radius * p.radius);
@@ -1806,7 +1810,7 @@ mod bdpt {
                     delta: false,
                     beta,
                     p,
-                    n: Vec3::new(0.0, 0.0, 0.0), // ?????
+                    n: vec3(0.0, 0.0, 0.0), // ?????
                 },
             })
         }
@@ -2069,7 +2073,8 @@ mod bdpt {
         let le = sample.le;
         let beta = le / (sample.pdf_dir * sample.pdf_pos * light_pdf)
             * glm::dot(&sample.ray.d, &sample.n).abs();
-        let vertex = Vertex::create_light_vertex(light, sample.ray.o, le, light_pdf * sample.pdf_pos);
+        let vertex =
+            Vertex::create_light_vertex(light, sample.ray.o, le, light_pdf * sample.pdf_pos);
         path.push(vertex);
         random_walk(
             scene,
@@ -2347,7 +2352,7 @@ impl Integrator for BDPT {
             let mut sampler = PCGSampler { rng: PCG::new(id) };
             let x = (id as u32) % scene.camera.resolution().x;
             let y = (id as u32) / scene.camera.resolution().x;
-            let pixel = glm::UVec2::new(x, y);
+            let pixel = uvec2(x, y);
             let mut acc_li = Spectrum::zero();
             let mut camera_path = vec![];
             let mut light_path = vec![];
@@ -2396,7 +2401,7 @@ impl Integrator for BDPT {
             acc_li = acc_li / (self.spp as Float);
             {
                 let film = &mut film.write().unwrap();
-                film.add_sample(&glm::UVec2::new(x, y), &acc_li, 1.0);
+                film.add_sample(&uvec2(x, y), &acc_li, 1.0);
             }
             if self.debug {
                 for t in 2..=(self.max_depth + 2) as isize {
@@ -2408,7 +2413,7 @@ impl Integrator for BDPT {
                         let idx = get_index(s, t);
                         let film = &mut pyramid[idx].write().unwrap();
                         film.add_sample(
-                            &glm::UVec2::new(x, y),
+                            &uvec2(x, y),
                             &(debug_acc[idx] / (self.spp as Float) as Float),
                             1.0,
                         );
@@ -2434,7 +2439,442 @@ impl Integrator for BDPT {
         film.into_inner().unwrap()
     }
 }
+#[macro_use]
+mod nn {
+    use std::marker::PhantomData;
+
+    use super::*;
+    // unsafe fn atomic_fetch_add_f32(p: *mut f32, val: f32) -> f32 {
+    //     use std::mem::size_of;
+    //     let at = &*std::mem::transmute::<*mut f32, *mut AtomicFloat>(p);
+    //     assert!(size_of::<AtomicFloat>() == size_of::<f32>());
+    //     at.fetch_add(val, Ordering::SeqCst)
+    // }
+    #[derive(Clone, Copy)]
+    pub struct Dual<T> {
+        val: T,
+        deriv: T,
+    }
+    pub trait ActivationFunction {
+        fn forward(&self, x: f32) -> f32;
+        fn backward(&self, out: Dual<f32>, x: f32) -> f32;
+        fn new() -> Self;
+    }
+    pub struct Sigmoid {}
+    impl ActivationFunction for Sigmoid {
+        fn forward(&self, x: f32) -> f32 {
+            1.0 / (1.0 + (-x).exp())
+        }
+        fn backward(&self, out: Dual<f32>, _x: f32) -> f32 {
+            (1.0 - out.val) * out.val * out.deriv
+        }
+        fn new() -> Self {
+            Self {}
+        }
+    }
+    pub struct Relu {}
+    impl ActivationFunction for Relu {
+        fn forward(&self, x: f32) -> f32 {
+            x.max(0.0)
+        }
+        fn backward(&self, out: Dual<f32>, x: f32) -> f32 {
+            if x >= 0.0 {
+                out.deriv
+            } else {
+                0.0
+            }
+        }
+        fn new() -> Self {
+            Self {}
+        }
+    }
+    pub struct Tanh {}
+    impl ActivationFunction for Tanh {
+        fn forward(&self, x: f32) -> f32 {
+            x.tanh()
+        }
+        fn backward(&self, out: Dual<f32>, _x: f32) -> f32 {
+            (1.0 - out.val * out.val) * out.deriv
+        }
+        fn new() -> Self {
+            Self {}
+        }
+    }
+    pub struct Linear {}
+    impl ActivationFunction for Linear {
+        fn forward(&self, x: f32) -> f32 {
+            x
+        }
+        fn backward(&self, out: Dual<f32>, x: f32) -> f32 {
+            out.deriv
+        }
+        fn new() -> Self {
+            Self {}
+        }
+    }
+    pub trait OptimizerImpl: Default + Clone {
+        fn step(&mut self, val: &mut f32, grad: f32);
+    }
+    #[derive(Clone)]
+    pub struct Optimizer<T, Impl> {
+        // fn step(&mut self, val:&mut T, grad: &T);
+        data: PhantomData<T>,
+        impl_: Vec<Impl>,
+    }
+    impl<Impl: OptimizerImpl, const M: usize, const N: usize> Optimizer<na::SMatrix<f32, M, N>, Impl> {
+        fn new(opt: Impl) -> Self {
+            Self {
+                data: PhantomData {},
+                impl_: vec![opt; M * N],
+            }
+        }
+        fn step(&mut self, val: &mut na::SMatrix<f32, M, N>, grad: &na::SMatrix<f32, M, N>) {
+            assert!(self.impl_.len() == M * N);
+            // if self.impl_.len() != M * N {
+            //     self.impl_.resize(M * N, self.impl_[0].clone());
+            // }
+            for i in 0..(M * N) {
+                self.impl_[i].step(&mut (*val)[i], grad[i]);
+            }
+        }
+    }
+    #[derive(Copy, Clone)]
+    pub struct SGD {
+        pub learning_rate: f32,
+    }
+    impl Default for SGD {
+        fn default() -> Self {
+            SGD {
+                learning_rate: 0.01,
+            }
+        }
+    }
+    impl OptimizerImpl for SGD {
+        fn step(&mut self, val: &mut f32, grad: f32) {
+            *val -= self.learning_rate * grad;
+        }
+    }
+    #[macro_use]
+    pub mod mlp {
+        use super::*;
+        // pub struct
+        // pub struct MLPEvalContext<const I: usize, const O:usize> {
+        //     x:na::DMatrix<f32>,
+        //     scratch:na::DMatrix<f32>,
+
+        // }
+        pub trait Module<const I: usize, const O: usize> {
+            type Temp;
+            fn forward(
+                &self,
+                x: &na::SVector<f32, I>,
+                temp: Option<&mut Self::Temp>,
+            ) -> na::SVector<f32, O>;
+            fn backward(
+                &mut self,
+                x: &na::SVector<f32, I>,
+                out: Dual<&na::SVector<f32, O>>,
+                temp: &Self::Temp,
+            ) -> na::SVector<f32, I>;
+            fn create_temp(&self) -> Self::Temp;
+        }
+        #[derive(Clone)]
+        pub struct Activation<F: ActivationFunction> {
+            pub f: F,
+        }
+        impl<F: ActivationFunction, const N: usize> Module<N, N> for Activation<F> {
+            type Temp = ();
+            fn create_temp(&self) -> Self::Temp {}
+            fn forward(
+                &self,
+                x: &na::SVector<f32, N>,
+                _temp: Option<&mut Self::Temp>,
+            ) -> na::SVector<f32, N> {
+                x.map(|t| self.f.forward(t))
+            }
+            fn backward(
+                &mut self,
+                x: &na::SVector<f32, N>,
+                out: Dual<&na::SVector<f32, N>>,
+                _temp: &Self::Temp,
+            ) -> na::SVector<f32, N> {
+                let mut grad: na::SVector<f32, N> = na::zero();
+                for i in 0..N {
+                    grad[i] = self.f.backward(
+                        Dual {
+                            val: out.val[i],
+                            deriv: out.deriv[i],
+                        },
+                        x[i],
+                    );
+                }
+                // println!("{}", grad);
+                grad
+            }
+        }
+        #[derive(Clone)]
+        pub struct Linear<Opt, const I: usize, const O: usize> {
+            pub weights: na::SMatrix<f32, O, I>,
+            pub bias: na::SVector<f32, O>,
+            pub weights_opt: Optimizer<na::SMatrix<f32, O, I>, Opt>,
+            pub bias_opt: Optimizer<na::SVector<f32, O>, Opt>,
+        }
+        impl<Opt, const I: usize, const O: usize> Linear<Opt, I, O>
+        where
+            Opt: OptimizerImpl,
+        {
+            pub fn new(opt: Opt) -> Self {
+                use rand::Rng;
+                let mut rng = rand::thread_rng();
+                let mut weights: na::SMatrix<f32, O, I> = na::zero();
+                let bias = na::zero();
+                weights = weights.map(|_| 2.0 * rng.gen::<f32>() - 1.0);
+                Self {
+                    weights,
+                    bias,
+                    weights_opt: Optimizer::new(opt.clone()),
+                    bias_opt: Optimizer::new(opt.clone()),
+                }
+            }
+        }
+        impl<Opt, const I: usize, const O: usize> Module<I, O> for Linear<Opt, I, O>
+        where
+            Opt: OptimizerImpl,
+        {
+            type Temp = (); //na::SVector<f32, O>;
+            fn create_temp(&self) -> Self::Temp {}
+            fn forward(
+                &self,
+                x: &na::SVector<f32, I>,
+                _temp: Option<&mut Self::Temp>,
+            ) -> na::SVector<f32, O> {
+                self.weights * x + self.bias
+            }
+            fn backward(
+                &mut self,
+                x: &na::SVector<f32, I>,
+                out: Dual<&na::SVector<f32, O>>,
+                _temp: &Self::Temp,
+            ) -> na::SVector<f32, I> {
+                let dbias = out.deriv;
+                let dw = out.deriv * x.transpose();
+                let dx = self.weights.transpose() * out.deriv;
+                //  println!("{} {}", dw, dx);
+                self.bias_opt.step(&mut self.bias, dbias);
+                self.weights_opt.step(&mut self.weights, &dw);
+                dx
+            }
+        }
+        #[derive(Clone)]
+        pub struct Layer<F: ActivationFunction, Opt, const I: usize, const O: usize> {
+            pub linear: Linear<Opt, I, O>,
+            pub act: Activation<F>,
+        }
+        impl<F: ActivationFunction, Opt, const I: usize, const O: usize> Layer<F, Opt, I, O>
+        where
+            Opt: OptimizerImpl,
+        {
+            pub fn new(opt: Opt) -> Self {
+                Self {
+                    linear: Linear::new(opt.clone()),
+                    act: Activation { f: F::new() },
+                }
+            }
+        }
+        impl<F: ActivationFunction, Opt, const I: usize, const O: usize> Module<I, O>
+            for Layer<F, Opt, I, O>
+        where
+            Opt: OptimizerImpl,
+        {
+            type Temp = na::SVector<f32, O>;
+            fn create_temp(&self) -> Self::Temp {
+                na::zero()
+            }
+            fn forward(
+                &self,
+                x: &na::SVector<f32, I>,
+                temp: Option<&mut Self::Temp>,
+            ) -> na::SVector<f32, O> {
+                let v = self.linear.forward(x, None);
+                if let Some(temp) = temp {
+                    *temp = v;
+                }
+                self.act.forward(&v, None)
+            }
+            fn backward(
+                &mut self,
+                x: &na::SVector<f32, I>,
+                out: Dual<&na::SVector<f32, O>>,
+                linear_out: &Self::Temp,
+            ) -> na::SVector<f32, I> {
+                let linear_grad = self.act.backward(linear_out, out, &());
+                let dlinear = Dual {
+                    val: linear_out,
+                    deriv: &linear_grad,
+                };
+                self.linear.backward(x, dlinear, &())
+            }
+        }
+
+        #[derive(Clone)]
+        pub struct CombineModules<A, B, const I: usize, const H: usize, const O: usize> {
+            pub a: A,
+            pub b: B,
+        }
+        impl<A, B, const I: usize, const H: usize, const O: usize> Module<I, O>
+            for CombineModules<A, B, I, H, O>
+        where
+            A: Module<I, H>,
+            B: Module<H, O>,
+        {
+            type Temp = (
+                <A as Module<I, H>>::Temp,
+                <B as Module<H, O>>::Temp,
+                na::SVector<f32, H>,
+            );
+            fn create_temp(&self) -> Self::Temp {
+                (self.a.create_temp(), self.b.create_temp(), na::zero())
+            }
+            fn forward(
+                &self,
+                x: &na::SVector<f32, I>,
+                temp: Option<&mut Self::Temp>,
+            ) -> na::SVector<f32, O> {
+                let p_temp = temp.map_or(std::ptr::null_mut(), |t| t as *mut Self::Temp);
+                let v = unsafe {
+                    let temp = p_temp.as_mut();
+                    self.a.forward(x, temp.map(|y| &mut y.0))
+                };
+                if !p_temp.is_null() {
+                    unsafe {
+                        let temp = p_temp.as_mut();
+                        temp.unwrap().2 = v;
+                    }
+                }
+                unsafe {
+                    let temp = p_temp.as_mut();
+                    self.b.forward(&v, temp.map(|y| &mut y.1))
+                }
+            }
+            fn backward(
+                &mut self,
+                x: &na::SVector<f32, I>,
+                out: Dual<&na::SVector<f32, O>>,
+                temp: &Self::Temp,
+            ) -> na::SVector<f32, I> {
+                let gradb = self.b.backward(&temp.2, out, &temp.1);
+                let db = Dual {
+                    val: &temp.2,
+                    deriv: &gradb,
+                };
+                self.a.backward(x, db, &temp.0)
+            }
+        }
+    }
+    use mlp::Module;
+    pub struct Model<M: Module<I, O>, const I: usize, const O: usize> {
+        pub m: M,
+    }
+    impl<M: Module<I, O>, const I: usize, const O: usize> Model<M, I, O> {
+        pub fn new(m: M) -> Self {
+            Self { m }
+        }
+        pub fn infer(&self, x: &na::SVector<f32, I>) -> na::SVector<f32, O> {
+            self.m.forward(x, None)
+        }
+        pub fn train(&mut self, x: &na::SVector<f32, I>, target: na::SVector<f32, O>) -> f32 {
+            let mut temp = self.m.create_temp();
+            let y = self.m.forward(x, Some(&mut temp));
+            let (loss, dy) = {
+                let d = y - target;
+                (d.component_mul(&d).sum(), 2.0 * d)
+            };
+
+            self.m.backward(
+                x,
+                Dual {
+                    val: &y,
+                    deriv: &dy,
+                },
+                &temp,
+            );
+            loss
+        }
+    }
+    #[macro_export]
+    macro_rules! sequential {
+       ($layer:expr) => {
+           $layer
+       };
+       ($layer0:expr, $($rest:expr), *)=>{
+           CombineModules{
+               a:$layer0,
+               b:sequential!($($rest), *)
+           }
+       };
+   }
+    macro_rules! create_mlp_helper {
+    ($opt_v:expr, $act:ty, $opt:ty, $dim1:expr, $dim2:expr)=>{
+        mlp::Linear::<$opt, $dim1, $dim2>::new($opt_v)
+    };
+    ($opt_v:expr,$act:ty, $opt:ty,  $dim1:expr,$dim2:expr, $($rest:expr), *)=>{
+
+    CombineModules{
+               a: Layer::<$act, $opt, $dim1, $dim2>::new($opt_v),
+               b:create_mlp_helper!($opt_v, $act, $opt, $dim2, $($rest), *)
+           }
+        };
+   }
+    #[macro_export]
+    macro_rules! create_mlp {
+    ($opt_v:expr, $act:ty, $opt:ty,  $($rest:expr), *)=>{
+        Model::new(create_mlp_helper!($opt_v, $act, $opt, $($rest), *))
+    }
+   }
+}
+mod nrc {
+    struct RadianceCache {}
+}
+
 fn main() {
+    // #[macro_use(nn::mlp)]
+    use nn::mlp::CombineModules;
+    // use nn::mlp
+    use nn::*;
+    let opt = SGD { learning_rate: 0.1 };
+    // let layer0: Layer<Linear, SGD, 2, 4> = Layer::new(opt.clone());
+
+    // let layer1: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
+    // let layer1: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
+    // let layer3: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
+    // let layer4: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
+    // let layer5: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
+    // let layer6: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
+    // let layer7: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
+
+    // let mut net = Model::new(sequential!(layer0, layer1));
+    let mut net = create_mlp!(opt, Relu, SGD, 1, 8, 1);
+
+    fn f(x: &na::SVector<f32, 1>) -> na::SVector<f32, 1> {
+        // na::SVector::<f32, 1>::new(x[0] + x[1])
+        na::SVector::<f32, 1>::new(x[0].sin())
+    }
+    let mut rng = rand::thread_rng();
+    for iter in 0..100000 {
+        let x = na::zero::<na::SVector<f32, 1>>().map(|_| rng.gen::<f32>() * 2.0 - 1.0);
+        let y = net.infer(&x);
+        let loss = net.train(&x, f(&x));
+        if iter % 1000 == 0 {
+            // println!("training on {} {}; {}",&x, f(&x), y);
+            println!("{} {}", iter, loss);
+        }
+    }
+    // println!("{}", net)
+    println!("{} {}", net.infer(& na::SVector::<f32, 1>::new(0.3f32)), f(& na::SVector::<f32, 1>::new(0.3f32)));
+    // println!("{} {}", net.m.a.linear.weights, net.m.a.linear.bias);
+    // println!("{} {}", net.m.b.weights, net.m.b.bias);
+}
+fn main0() {
     // rayon::ThreadPoolBuilder::new()
     //     .num_threads(1)
     //     .build_global()
@@ -2443,56 +2883,56 @@ fn main() {
         reflecance: Spectrum::one(),
     });
     let red = Arc::new(DiffuseBSDF {
-        reflecance: Spectrum::from_srgb(&Vec3::new(0.75, 0.25, 0.25)),
+        reflecance: Spectrum::from_srgb(&vec3(0.75, 0.25, 0.25)),
     });
     let green = Arc::new(DiffuseBSDF {
-        reflecance: Spectrum::from_srgb(&Vec3::new(0.25, 0.75, 0.25)),
+        reflecance: Spectrum::from_srgb(&vec3(0.25, 0.75, 0.25)),
     });
     let shape = {
         let mut shapes: Vec<Arc<dyn Shape>> = vec![];
         shapes.push(Arc::new(Sphere {
-            center: Vec3::new(0.0, 0.0, -4.0),
+            center: vec3(0.0, 0.0, -4.0),
             radius: 1.0,
             bsdf: white.clone(),
         }));
         shapes.push(Arc::new(Sphere {
-            center: Vec3::new(10000.0 + 4.0, 0.0, -0.0),
+            center: vec3(10000.0 + 4.0, 0.0, -0.0),
             radius: 10000.0,
             bsdf: red.clone(),
         }));
         shapes.push(Arc::new(Sphere {
-            center: Vec3::new(-10000.0 - 4.0, 0.0, -0.0),
+            center: vec3(-10000.0 - 4.0, 0.0, -0.0),
             radius: 10000.0,
             bsdf: green.clone(),
         }));
         shapes.push(Arc::new(Sphere {
-            center: Vec3::new(0.0, -10000.0 - 1.0, -0.0),
+            center: vec3(0.0, -10000.0 - 1.0, -0.0),
             radius: 10000.0,
             bsdf: white.clone(),
         }));
         shapes.push(Arc::new(Sphere {
-            center: Vec3::new(0.0, 10000.0 + 6.0, -0.0),
+            center: vec3(0.0, 10000.0 + 6.0, -0.0),
             radius: 10000.0,
             bsdf: white.clone(),
         }));
         shapes.push(Arc::new(Sphere {
-            center: Vec3::new(0.0, 0.0, -10015.0),
+            center: vec3(0.0, 0.0, -10015.0),
             radius: 10000.0,
             bsdf: white.clone(),
         }));
         Arc::new(Aggregate::new(shapes))
     };
     let camera = {
-        let m = glm::translate(&glm::identity(), &Vec3::new(0.0, 0.4, 0.0));
+        let m = glm::translate(&glm::identity(), &vec3(0.0, 0.4, 0.0));
         Arc::new(PerspectiveCamera::new(
-            &glm::UVec2::new(512, 512),
+            &uvec2(512, 512),
             &Transform::from_matrix(&m),
             (80.0 as Float).to_radians(),
         ))
     };
     let lights: Vec<Arc<dyn Light>> = vec![Arc::new(PointLight {
         emission: Spectrum::one() * 40.0,
-        position: Vec3::new(0.3, 4.0, 0.0),
+        position: vec3(0.3, 4.0, 0.0),
     })];
     let scene = Scene {
         shape,
