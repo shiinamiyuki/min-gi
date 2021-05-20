@@ -21,7 +21,7 @@ use std::{
     usize,
 };
 
-use crate::nn::{mlp::Layer, Relu, SGD};
+use crate::nn::{mlp::Dense, Relu, SGD};
 
 type Float = f64;
 type Vec3 = glm::TVec3<Float>;
@@ -120,6 +120,10 @@ impl Bound3<Float> {
     pub fn diagonal(&self) -> Vec3 {
         self.max - self.min
     }
+    pub fn contains(&self, p: &Vec3) -> bool {
+        glm::all(&glm::less_than_equal(&p, &self.max))
+            && glm::all(&glm::greater_than_equal(&p, &self.min))
+    }
 }
 impl Default for Bound3<Float> {
     fn default() -> Self {
@@ -143,7 +147,11 @@ where
 pub struct Spectrum {
     pub samples: Vec3,
 }
-
+impl From<na::SVector<f32, { Spectrum::N_SAMPLES }>> for Spectrum {
+    fn from(v: na::SVector<f32, { Spectrum::N_SAMPLES }>) -> Self {
+        Spectrum { samples: v.cast() }
+    }
+}
 impl Spectrum {
     pub const N_SAMPLES: usize = 3;
     pub fn from_srgb(rgb: &Vec3) -> Spectrum {
@@ -410,6 +418,11 @@ pub fn uniform_sphere_sampling(u: &Vec2) -> Vec3 {
 pub fn uniform_sphere_pdf() -> Float {
     1.0 / (4.0 * PI)
 }
+pub fn dir_to_spherical(v: &Vec3) -> Vec2 {
+    let theta = v.y.acos();
+    let phi = (v.z / v.x).atan();
+    vec2(theta, phi)
+}
 pub fn parallel_for<F: Fn(usize) -> () + Sync>(count: usize, chunk_size: usize, f: F) {
     let chunks = (count + chunk_size - 1) / chunk_size;
     (0..chunks).into_par_iter().for_each(|chunk_id| {
@@ -558,35 +571,37 @@ impl<'a> BSDFClosure<'a> {
         Some(sample)
     }
 }
-#[derive(Clone)]
+#[derive(Copy, Clone)]
 struct Pixel {
     intensity: Spectrum,
     weight: Float,
 }
 struct Film {
-    pixels: Vec<Pixel>,
+    pixels: RwLock<Vec<Pixel>>,
     resolution: glm::UVec2,
 }
 impl Film {
     pub fn new(resolution: &glm::UVec2) -> Self {
         Self {
-            pixels: vec![
+            pixels: RwLock::new(vec![
                 Pixel {
                     intensity: Spectrum::zero(),
                     weight: 0.0
                 };
                 (resolution.x * resolution.y) as usize
-            ],
+            ]),
             resolution: *resolution,
         }
     }
-    pub fn add_sample(&mut self, pixel: &glm::UVec2, value: &Spectrum, weight: Float) {
-        let pixel = &mut self.pixels[(pixel.x + pixel.y * self.resolution.x) as usize];
+    pub fn add_sample(&self, pixel: &glm::UVec2, value: &Spectrum, weight: Float) {
+        let mut pixels = self.pixels.write().unwrap();
+        let pixel = &mut (*pixels)[(pixel.x + pixel.y * self.resolution.x) as usize];
         pixel.intensity = pixel.intensity + *value;
         pixel.weight += weight;
     }
-    pub fn get_pixel(&self, pixel: &glm::UVec2) -> &Pixel {
-        &self.pixels[(pixel.x + pixel.y * self.resolution.x) as usize]
+    pub fn get_pixel(&self, pixel: &glm::UVec2) -> Pixel {
+        let pixels = self.pixels.read().unwrap();
+        (*pixels)[(pixel.x + pixel.y * self.resolution.x) as usize]
     }
     pub fn to_rgb_image(&self) -> image::RgbImage {
         let image = image::ImageBuffer::from_fn(self.resolution.x, self.resolution.y, |x, y| {
@@ -1298,7 +1313,7 @@ impl Integrator for PathTracer {
     type Output = Film;
     fn render(&mut self, scene: &Scene) -> Self::Output {
         let npixels = (scene.camera.resolution().x * scene.camera.resolution().y) as usize;
-        let film = RwLock::new(Film::new(&scene.camera.resolution()));
+        let film = Film::new(&scene.camera.resolution());
         parallel_for(npixels, 256, |id| {
             let mut sampler = PCGSampler { rng: PCG::new(id) };
             let x = (id as u32) % scene.camera.resolution().x;
@@ -1360,12 +1375,9 @@ impl Integrator for PathTracer {
                 acc_li += li;
             }
             acc_li = acc_li / (self.spp as Float);
-            {
-                let film = &mut film.write().unwrap();
-                film.add_sample(&uvec2(x, y), &acc_li, 1.0);
-            }
+            film.add_sample(&uvec2(x, y), &acc_li, 1.0);
         });
-        film.into_inner().unwrap()
+        film
     }
 }
 
@@ -1539,7 +1551,7 @@ impl Integrator for SPPM {
     type Output = Film;
     fn render(&mut self, scene: &Scene) -> Self::Output {
         let npixels = (scene.camera.resolution().x * scene.camera.resolution().y) as usize;
-        let film = RwLock::new(Film::new(&scene.camera.resolution()));
+        let film = Film::new(&scene.camera.resolution());
         let mut pixels: Vec<SPPMPixel> = vec![
             SPPMPixel {
                 radius: self.initial_radius,
@@ -1726,12 +1738,10 @@ impl Integrator for SPPM {
             let p = unsafe { p_pixels.offset(id as isize).as_ref().unwrap() };
             let l =
                 p.tau / ((self.iterations * self.n_photons) as Float * PI * p.radius * p.radius);
-            {
-                let film = &mut film.write().unwrap();
-                film.add_sample(&pixel, &l, 1.0);
-            }
+
+            film.add_sample(&pixel, &l, 1.0);
         });
-        film.into_inner().unwrap()
+        film
     }
 }
 
@@ -2336,11 +2346,11 @@ impl Integrator for BDPT {
     type Output = Film;
     fn render(&mut self, scene: &Scene) -> Self::Output {
         let npixels = (scene.camera.resolution().x * scene.camera.resolution().y) as usize;
-        let film = RwLock::new(Film::new(&scene.camera.resolution()));
+        let film = Film::new(&scene.camera.resolution());
         let mut pyramid = Vec::new();
         for _t in 2..=self.max_depth + 2 {
             for _s in 0..self.max_depth + 2 {
-                pyramid.push(RwLock::new(Film::new(&scene.camera.resolution())));
+                pyramid.push(Film::new(&scene.camera.resolution()));
             }
         }
         let get_index = |s, t| (t - 2) as usize * (3 + self.max_depth) + s as usize;
@@ -2395,10 +2405,9 @@ impl Integrator for BDPT {
                 }
             }
             acc_li = acc_li / (self.spp as Float);
-            {
-                let film = &mut film.write().unwrap();
-                film.add_sample(&uvec2(x, y), &acc_li, 1.0);
-            }
+
+            film.add_sample(&uvec2(x, y), &acc_li, 1.0);
+
             if self.debug {
                 for t in 2..=(self.max_depth + 2) as isize {
                     for s in 0..=(self.max_depth + 2) as isize {
@@ -2407,8 +2416,7 @@ impl Integrator for BDPT {
                             continue;
                         }
                         let idx = get_index(s, t);
-                        let film = &mut pyramid[idx].write().unwrap();
-                        film.add_sample(
+                        pyramid[idx].add_sample(
                             &uvec2(x, y),
                             &(debug_acc[idx] / (self.spp as Float) as Float),
                             1.0,
@@ -2425,18 +2433,19 @@ impl Integrator for BDPT {
                         continue;
                     }
                     let idx = get_index(s, t);
-                    let film = &pyramid[idx].read().unwrap();
+                    let film = &pyramid[idx];
                     let img = film.to_rgb_image();
                     img.save(format!("bdpt-d{}-s{}-t{}.png", depth, s, t))
                         .unwrap();
                 }
             }
         }
-        film.into_inner().unwrap()
+        film
     }
 }
 #[macro_use]
 mod nn {
+    use core::f64;
     use std::marker::PhantomData;
 
     use super::*;
@@ -2550,6 +2559,92 @@ mod nn {
             *val -= self.learning_rate * grad;
         }
     }
+    #[derive(Copy, Clone)]
+    pub struct Momentum {
+        pub a: f32,
+        pub v: f32,
+        pub learning_rate: f32,
+    }
+    impl Default for Momentum {
+        fn default() -> Self {
+            Momentum {
+                learning_rate: 0.01,
+                v: 0.0,
+                a: 0.9,
+            }
+        }
+    }
+    impl OptimizerImpl for Momentum {
+        fn step(&mut self, val: &mut f32, grad: f32) {
+            self.v = self.a * self.v + self.learning_rate * grad;
+            *val -= self.v;
+        }
+    }
+    #[derive(Copy, Clone)]
+    pub struct Batch<O: OptimizerImpl> {
+        pub opt: O,
+        pub batch_size: u32,
+        pub count: u32,
+        pub sum: f32,
+    }
+    impl<O: OptimizerImpl> Default for Batch<O> {
+        fn default() -> Self {
+            Batch {
+                opt: Default::default(),
+                batch_size: 1,
+                count: 0,
+                sum: 0.0,
+            }
+        }
+    }
+    impl<O: OptimizerImpl> OptimizerImpl for Batch<O> {
+        fn step(&mut self, val: &mut f32, grad: f32) {
+            // self.v = self.a * self.v + self.learning_rate * grad;
+            // *val -= self.v;
+            self.sum += grad;
+            self.count += 1;
+            if self.count >= self.batch_size {
+                let grad = self.sum / self.count as f32;
+                self.opt.step(val, grad);
+                self.sum = 0.0;
+                self.count = 0;
+            }
+        }
+    }
+    #[derive(Copy, Clone)]
+    pub struct Adam {
+        pub learning_rate: f32,
+        pub m: f64,
+        pub v: f64,
+        pub beta1: f64,
+        pub beta2: f64,
+        pub t: usize,
+    }
+    impl Default for Adam {
+        fn default() -> Self {
+            Adam {
+                learning_rate: 0.01,
+                m: 0.0,
+                v: 0.0,
+                beta1: 0.9,
+                beta2: 0.999,
+                t: 0,
+            }
+        }
+    }
+    impl OptimizerImpl for Adam {
+        fn step(&mut self, val: &mut f32, grad: f32) {
+            let grad = grad as f64;
+            self.t += 1;
+            // *val -= self.learning_rate * grad;
+            self.m = self.beta1 * self.m + (1.0 - self.beta1) * grad;
+            self.v = self.beta2 * self.v + (1.0 - self.beta2) * grad * grad;
+            let m_tilde = self.m / (1.0 - self.beta1.powf(self.t as f64));
+            let v_tilde = self.v / (1.0 - self.beta2.powf(self.t as f64));
+
+            *val -= self.learning_rate * (m_tilde / (v_tilde.sqrt() + 1e-8f64)) as f32;
+        }
+    }
     #[macro_use]
     pub mod mlp {
         use super::*;
@@ -2620,11 +2715,14 @@ mod nn {
             Opt: OptimizerImpl,
         {
             pub fn new(opt: Opt) -> Self {
+                use rand::distributions::Distribution;
                 use rand::Rng;
+                use statrs::distribution::Normal;
                 let mut rng = rand::thread_rng();
+                let n = Normal::new(0.0, (2.0 / (I + O) as f64).sqrt()).unwrap();
                 let mut weights: na::SMatrix<f32, O, I> = na::zero();
                 let bias = na::zero();
-                weights = weights.map(|_| 2.0 * rng.gen::<f32>() - 1.0);
+                weights = weights.map(|_| n.sample(&mut rng) as f32);
                 Self {
                     weights,
                     bias,
@@ -2655,6 +2753,7 @@ mod nn {
                 let dbias = out.deriv;
                 let dw = out.deriv * x.transpose();
                 let dx = self.weights.transpose() * out.deriv;
+                // let dx =(out.deriv.transpose() * self.weights).transpose();
                 //  println!("{} {}", dw, dx);
                 self.bias_opt.step(&mut self.bias, dbias);
                 self.weights_opt.step(&mut self.weights, &dw);
@@ -2662,11 +2761,11 @@ mod nn {
             }
         }
         #[derive(Clone)]
-        pub struct Layer<F: ActivationFunction, Opt, const I: usize, const O: usize> {
+        pub struct Dense<F: ActivationFunction, Opt, const I: usize, const O: usize> {
             pub linear: Linear<Opt, I, O>,
             pub act: Activation<F>,
         }
-        impl<F: ActivationFunction, Opt, const I: usize, const O: usize> Layer<F, Opt, I, O>
+        impl<F: ActivationFunction, Opt, const I: usize, const O: usize> Dense<F, Opt, I, O>
         where
             Opt: OptimizerImpl,
         {
@@ -2678,7 +2777,7 @@ mod nn {
             }
         }
         impl<F: ActivationFunction, Opt, const I: usize, const O: usize> Module<I, O>
-            for Layer<F, Opt, I, O>
+            for Dense<F, Opt, I, O>
         where
             Opt: OptimizerImpl,
         {
@@ -2772,9 +2871,9 @@ mod nn {
         pub m: M,
     }
     impl<M: Module<I, O>, const I: usize, const O: usize> Model<M, I, O> {
-        pub fn new(m: M) -> Self {
-            Self { m }
-        }
+        // pub fn new(m: M) -> Self {
+        //     Self { m }
+        // }
         pub fn infer(&self, x: &na::SVector<f32, I>) -> na::SVector<f32, O> {
             self.m.forward(x, None)
         }
@@ -2783,7 +2882,7 @@ mod nn {
             let y = self.m.forward(x, Some(&mut temp));
             let (loss, dy) = {
                 let d = y - target;
-                (d.component_mul(&d).sum(), 2.0 * d)
+                (d.component_mul(&d).mean(), 2.0 * d)
             };
 
             self.m.backward(
@@ -2810,71 +2909,422 @@ mod nn {
        };
    }
     macro_rules! create_mlp_helper {
-    ($opt_v:expr, $act:ty, $opt:ty, $dim1:expr, $dim2:expr)=>{
-        crate::nn::mlp::Linear::<$opt, $dim1, $dim2>::new($opt_v)
-    };
-    ($opt_v:expr,$act:ty, $opt:ty,  $dim1:expr,$dim2:expr, $($rest:expr), *)=>{
-
-    CombineModules{
-               a: crate::nn::mlp::Layer::<$act, $opt, $dim1, $dim2>::new($opt_v),
-               b:create_mlp_helper!($opt_v, $act, $opt, $dim2, $($rest), *)
-           }
+        ($opt_v:expr, $act:ty, $opt:ty, $dim1:expr, $dim2:expr)=>{
+            crate::nn::mlp::Linear::<$opt, $dim1, $dim2>::new($opt_v)
         };
+        ($opt_v:expr,$act:ty, $opt:ty,  $dim1:expr,$dim2:expr, $($rest:expr), *)=>{
+
+            crate::nn::mlp::CombineModules{
+                   a: crate::nn::mlp::Dense::<$act, $opt, $dim1, $dim2>::new($opt_v),
+                   b:create_mlp_helper!($opt_v, $act, $opt, $dim2, $($rest), *)
+               }
+            };
+       }
+    macro_rules! get_last {
+       ($x:expr) => {
+           $x
+       };
+       ($x:expr, $($xs:expr), *)=> {
+           get_last!($($xs), *)
+       };
+   }
+    macro_rules! mlp_type_helper {
+    ( $act:ty, $opt:ty, $dim1:expr, $dim2:expr)=>{
+        crate::nn::mlp::Linear<$opt, $dim1, $dim2>
+    };
+    ($act:ty, $opt:ty,  $dim1:expr,$dim2:expr, $($rest:expr), +)=>{
+        crate::nn::mlp::CombineModules<
+            crate::nn::mlp::Dense<$act, $opt, $dim1, $dim2>,
+        mlp_type_helper!( $act, $opt, $dim2, $($rest), *),
+        $dim1, $dim2, {get_last!($($rest), *)}>
+    };
    }
     #[macro_export]
     macro_rules! create_mlp {
-    ($opt_v:expr, $act:ty, $opt:ty,  $($rest:expr), *)=>{
-        Model::new(create_mlp_helper!($opt_v, $act, $opt, $($rest), *))
+    // ($name:ident, $act:ty, $opt:ty, $dim1:expr, $dim2:expr)=>{
+    //     type $name = crate::nn::Model<
+    //         inner:mlp_type_helper!($act, $opt, $dim1, $dim2)
+    //     >;
+    //     // Model::new(create_mlp_helper!($opt_v, $act, $opt, $($rest), *))
+    // };
+    ($name:ident, $act:ty, $opt:ty,$dim1:expr, $($rest:expr), +)=>{
+            pub type $name = crate::nn::Model<
+                    mlp_type_helper!($act, $opt,$dim1, $($rest), +),
+                    $dim1,
+                    {get_last!( $($rest), +)}
+                >;
+            impl $name {
+                pub fn new(o:$opt)->Self {
+                    Self{m:create_mlp_helper!(o, $act, $opt, $dim1, $($rest), +)}
+                }
+            }
+
     }
    }
 }
 mod nrc {
-    struct RadianceCache {}
+    use super::*;
+    use nalgebra as na;
+    use nalgebra_glm as glm;
+    use nn::mlp::Module;
+    use nn::*;
+    use rand::distributions::Distribution;
+    use rand::Rng;
+    use statrs::distribution::Normal;
+
+    // input: [x y z theta phi]
+    #[allow(non_snake_case)]
+    struct PositionEncoding {
+        B: na::Matrix5<f32>,
+    }
+    impl PositionEncoding {
+        fn new() -> Self {
+            let mut rng = rand::thread_rng();
+            let n = Normal::new(0.0, 1.0).unwrap();
+            PositionEncoding {
+                B: na::zero::<na::Matrix5<f32>>().map(|_| n.sample(&mut rng) as f32),
+            }
+        }
+        #[allow(non_snake_case)]
+        fn encode(&self, v: &na::Vector5<f32>) -> na::SVector<f32, 10> {
+            let A: na::Vector5<f32> = (2.0 * (PI as f32) * self.B * v).map(|x| x.cos());
+            let B: na::Vector5<f32> = (2.0 * (PI as f32) * self.B * v).map(|x| x.sin());
+            let M: na::SVector<f32, 10> =
+                na::SVector::<f32, 10>::from_iterator(A.iter().chain(B.iter()).map(|x| *x));
+            M
+        }
+    }
+    create_mlp!(NRCModel, Relu, Batch<SGD>, 10, 64, 64, 64, 64, 64, 64, {
+        Spectrum::N_SAMPLES
+    });
+
+    struct RadianceCache {
+        model: NRCModel,
+        encoding: PositionEncoding,
+        bound: Bounds3f,
+    }
+    impl RadianceCache {
+        fn new(opt: Batch<SGD>) -> Self {
+            Self {
+                model: NRCModel::new(opt),
+                encoding: PositionEncoding::new(),
+                bound: Bounds3f {
+                    min: vec3(1.0, 1.0, 1.0) * -20.0,
+                    max: vec3(1.0, 1.0, 1.0) * 20.0,
+                },
+            }
+        }
+        fn infer(&self, x: &Vec3, dir: &Vec2) -> Spectrum {
+            let v: na::SVector<f32, 5> = na::SVector::from_iterator(
+                self.bound
+                    .offset(&x)
+                    .into_iter()
+                    .chain(dir.into_iter())
+                    .map(|x| *x as f32),
+            );
+            let s: Spectrum = self.model.infer(&self.encoding.encode(&v)).into();
+            s
+        }
+        fn train(&mut self, x: &Vec3, dir: &Vec2, target: &Spectrum) {
+            if !self.bound.contains(&x) {
+                return;
+            }
+            let v: na::SVector<f32, 5> = na::SVector::from_iterator(
+                self.bound
+                    .offset(&x)
+                    .into_iter()
+                    .chain(dir.into_iter())
+                    .map(|x| *x as f32),
+            );
+            let _loss = self
+                .model
+                .train(&self.encoding.encode(&v), target.samples.cast::<f32>());
+            // println!("{} {}",v, _loss);
+        }
+    }
+    pub struct CachedPathTracer {
+        pub spp: u32,
+        pub max_depth: u32,
+    }
+    #[derive(Copy, Clone)]
+    struct Vertex {
+        x: Vec3,
+        dir: Vec2,
+        radiance: Spectrum,
+    }
+    #[derive(Copy, Clone)]
+    struct VertexTemp {
+        beta: Spectrum,
+        li: Spectrum,
+    }
+    impl CachedPathTracer {
+        fn li<'a>(
+            &self,
+            scene: &'a Scene,
+            mut ray: Ray,
+            sampler: &mut dyn Sampler,
+            max_depth: u32,
+            path: &mut Vec<Vertex>,
+            path_tmp: &mut Vec<VertexTemp>,
+            training: bool,
+            cache: &RwLock<RadianceCache>,
+        ) -> Spectrum {
+            let mut li = Spectrum::zero();
+            let mut beta = Spectrum::one();
+
+            let mut depth = 0;
+            path_tmp.clear();
+            path.clear();
+            if training {
+                path_tmp.push(VertexTemp {
+                    beta: Spectrum::one(),
+                    li: Spectrum::zero(),
+                });
+                path.push(Vertex {
+                    x: ray.o,
+                    dir: dir_to_spherical(&ray.d),
+                    radiance: Spectrum::zero(),
+                });
+            }
+
+            let accumulate_radiance = {
+                let p_li = &mut li as *mut Spectrum;
+                let p_beta = &mut beta as *mut Spectrum;
+                let p_path_tmp = path_tmp as *mut Vec<VertexTemp>;
+                move |l: Spectrum| unsafe {
+                    *p_li += *p_beta * l;
+                    if training {
+                        let path_tmp = &mut *p_path_tmp;
+                        for i in 0..path_tmp.len() {
+                            let beta = path_tmp[i].beta;
+                            path_tmp[i].li += beta * l;
+                        }
+                    }
+                }
+            };
+            let accumulate_beta = {
+                // let p_li = &mut li as *mut Spectrum;
+                let p_beta = &mut beta as *mut Spectrum;
+                let p_path_tmp = path_tmp as *mut Vec<VertexTemp>;
+                move |b: Spectrum| unsafe {
+                    // *p_li += *p_beta * l;
+                    *p_beta *= b;
+                    let path_tmp = &mut *p_path_tmp;
+                    if training {
+                        for i in 0..path_tmp.len() {
+                            path_tmp[i].beta *= b;
+                        }
+                    }
+                }
+            };
+            loop {
+                if let Some(isct) = scene.shape.intersect(&ray) {
+                    let ng = isct.ng;
+                    let frame = Frame::from_normal(&ng);
+                    let shape = isct.shape;
+                    let opt_bsdf = shape.bsdf();
+                    if opt_bsdf.is_none() {
+                        break;
+                    }
+                    let p = ray.at(isct.t);
+                    let bsdf = BSDFClosure {
+                        frame,
+                        bsdf: opt_bsdf.unwrap(),
+                    };
+                    let wo = -ray.d;
+                    if depth >= max_depth {
+                        break;
+                    }
+                    depth += 1;
+                    {
+                        let (light, light_pdf) = scene.light_distr.sample(sampler.next1d());
+                        let p_ref = ReferencePoint { p, n: ng };
+                        let light_sample = light.sample_li(&sampler.next2d(), &p_ref);
+                        if !light_sample.li.is_black()
+                            && !scene.shape.occlude(&light_sample.shadow_ray)
+                        {
+                            // li += beta
+                            //     * bsdf.evaluate(&wo, &light_sample.wi)
+                            //     * glm::dot(&ng, &light_sample.wi).abs()
+                            //     * light_sample.li
+                            //     / (light_sample.pdf * light_pdf);
+                            accumulate_radiance(
+                                bsdf.evaluate(&wo, &light_sample.wi)
+                                    * glm::dot(&ng, &light_sample.wi).abs()
+                                    * light_sample.li
+                                    / (light_sample.pdf * light_pdf),
+                            );
+                        }
+                    }
+
+                    if let Some(bsdf_sample) = bsdf.sample(&sampler.next2d(), &wo) {
+                        let wi = &bsdf_sample.wi;
+                        // if training {
+                        //     path_tmp.push(VertexTemp {
+                        //         beta: Spectrum::one(),
+                        //         li: Spectrum::zero(),
+                        //     });
+                        //     path.push(Vertex {
+                        //         x: p,
+                        //         dir: dir_to_spherical(wi),
+                        //         radiance: Spectrum::zero(),
+                        //     });
+                        // }
+
+                        ray = Ray::spawn(&p, wi).offset_along_normal(&ng);
+                        accumulate_beta(bsdf_sample.f * glm::dot(wi, &ng).abs() / bsdf_sample.pdf);
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            if training {
+                for i in 0..path.len() {
+                    path[i].radiance = path_tmp[i].li;
+                }
+            }
+            li
+        }
+    }
+    #[derive(Clone)]
+    struct PerThreadData {
+        path: Vec<Vertex>,
+        path_tmp: Vec<VertexTemp>,
+    }
+    impl Integrator for CachedPathTracer {
+        type Output = Film;
+        fn render(&mut self, scene: &Scene) -> Self::Output {
+            let npixels = (scene.camera.resolution().x * scene.camera.resolution().y) as usize;
+            let film = Film::new(&scene.camera.resolution());
+            let opt = Batch {
+                opt: SGD {
+                    learning_rate: 0.01,
+                },
+                batch_size: 8,
+                ..Default::default()
+            };
+            let cache = RwLock::new(RadianceCache::new(opt));
+            let mut samplers: Vec<Box<dyn Sampler>> = vec![];
+            for i in 0..npixels {
+                samplers.push(Box::new(PCGSampler { rng: PCG::new(i) }));
+            }
+            let mut per_thread_data: Vec<PerThreadData> = vec![
+                PerThreadData {
+                    path: vec![],
+                    path_tmp: vec![]
+                };
+                rayon::current_num_threads()
+            ];
+            for _ in 0..self.spp {
+                let p_samplers = &UnsafePointer::new(&mut samplers as *mut Vec<Box<dyn Sampler>>);
+                let p_per_thread_data =
+                    &UnsafePointer::new(&mut per_thread_data as *mut Vec<PerThreadData>);
+                parallel_for(npixels, 256, |id| {
+                    let samplers = unsafe { p_samplers.as_mut().unwrap() };
+                    let thread_data = unsafe {
+                        &mut (p_per_thread_data.as_mut().unwrap())
+                            [rayon::current_thread_index().unwrap()]
+                    };
+                    let sampler = &mut samplers[id];
+                    // let mut sampler = PCGSampler { rng: PCG::new(id) };
+                    let x = (id as u32) % scene.camera.resolution().x;
+                    let y = (id as u32) / scene.camera.resolution().x;
+                    let pixel = uvec2(x, y);
+                    let (ray, _ray_weight) = scene.camera.generate_ray(&pixel, sampler.as_mut());
+                    let path = &mut thread_data.path;
+                    let path_tmp = &mut thread_data.path_tmp;
+                    let training = (x % 8 == 0) && (y % 8 == 0);
+                    let _li = self.li(
+                        scene,
+                        ray,
+                        sampler.as_mut(),
+                        self.max_depth,
+                        path,
+                        path_tmp,
+                        training,
+                        &cache,
+                    );
+                    if training {
+                        let mut lk = cache.write().unwrap();
+                        let cache = &mut *lk;
+                        for vertex in path {
+                            vertex.dir.into_iter().for_each(|x| assert!(!x.is_nan()));
+                            cache.train(&vertex.x, &vertex.dir, &vertex.radiance);
+                        }
+                    }
+                });
+            }
+            println!("visiualizing");
+            parallel_for(npixels, 256, |id| {
+                let mut sampler = PCGSampler { rng: PCG::new(id) };
+                let x = (id as u32) % scene.camera.resolution().x;
+                let y = (id as u32) / scene.camera.resolution().x;
+                let pixel = uvec2(x, y);
+                let (ray, _ray_weight) = scene.camera.generate_ray(&pixel, &mut sampler);
+                let lk = cache.read().unwrap();
+                let cache = &*lk;
+                // let li = cache.infer(&ray.o, &dir_to_spherical(&ray.d));
+                let mut li = Spectrum::zero();
+                if let Some(isct) = scene.shape.intersect(&ray) {
+                    let p = ray.o; //ray.at(isct.t * 0.9);
+                    li = cache.infer(&p, &dir_to_spherical(&ray.d));
+                    // let n = isct.ng;
+                    // let frame = Frame::from_normal(&n);
+                    // f
+                    // println!("{}", li.samples);
+                }
+                film.add_sample(&uvec2(x, y), &li, 1.0);
+            });
+            film
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::nn::mlp::CombineModules;
+    // use nn::mlp
+    use super::nn::*;
+    use nalgebra as na;
+    use rand::Rng;
+    create_mlp!(Net, Relu, Momentum, 2, 8, 2);
     #[test]
     fn test_mlp() {
         // #[macro_use(nn::mlp)]
-        use super::nn::mlp::CombineModules;
-        // use nn::mlp
-        use super::nn::*;
-        use rand::Rng;
-        use nalgebra as na;
-        let opt = SGD { learning_rate: 0.1 };
-        // let layer0: Layer<Linear, SGD, 2, 4> = Layer::new(opt.clone());
 
-        // let layer1: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
-        // let layer1: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
-        // let layer3: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
-        // let layer4: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
-        // let layer5: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
-        // let layer6: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
-        // let layer7: Layer<Linear, SGD, 4, 1> = Layer::new(opt.clone());
+        let opt = Momentum {
+            learning_rate: 0.01,
+            ..Default::default()
+        };
 
         // let mut net = Model::new(sequential!(layer0, layer1));
-        let mut net = create_mlp!(opt, Relu, SGD, 1, 8, 1);
 
-        fn f(x: &na::SVector<f32, 1>) -> na::SVector<f32, 1> {
+        let mut net = Net::new(opt);
+
+        fn f(x: &na::SVector<f32, 2>) -> na::SVector<f32, 2> {
             // na::SVector::<f32, 1>::new(x[0] + x[1])
-            na::SVector::<f32, 1>::new(x[0].sin())
+            na::SVector::<f32, 2>::new(x[0] + x[1], x[0] - x[1])
         }
         let mut rng = rand::thread_rng();
         for iter in 0..100000 {
-            let x = na::zero::<na::SVector<f32, 1>>().map(|_| rng.gen::<f32>() * 2.0 - 1.0);
+            let x = na::zero::<na::SVector<f32, 2>>().map(|_| rng.gen::<f32>() * 2.0 - 1.0);
             // let y = net.infer(&x);
             let loss = net.train(&x, f(&x));
-            // if iter % 1000 == 0 {
-            //     // println!("training on {} {}; {}",&x, f(&x), y);
-            //     println!("{} {}", iter, loss);
-            // }
+            if iter % 1000 == 0 {
+                // println!("training on {} {}; {}",&x, f(&x), y);
+                println!("{} {}", iter, loss);
+            }
         }
         {
-            let x = na::SVector::<f32, 1>::new(0.3f32);
-            let y = net.infer(&na::SVector::<f32, 1>::new(0.3f32))[0];
-            let gt = f(&na::SVector::<f32, 1>::new(0.3f32))[0];
-            assert!((y - gt).abs() < 0.01);
+            let x = na::SVector::<f32, 2>::new(0.3, 0.2);
+            let y = net.infer(&x);
+            let gt = f(&x);
+            let err: f32 = (y - gt).norm();
+            assert!(err < 0.001);
+            assert!(!err.is_nan());
         }
         // println!("{}", net)
         // println!("{} {}", net.infer(& na::SVector::<f32, 1>::new(0.3f32)), f(& na::SVector::<f32, 1>::new(0.3f32)));
@@ -2933,7 +3383,7 @@ fn main() {
     let camera = {
         let m = glm::translate(&glm::identity(), &vec3(0.0, 0.4, 0.0));
         Arc::new(PerspectiveCamera::new(
-            &uvec2(512, 512),
+            &uvec2(256, 256),
             &Transform::from_matrix(&m),
             (80.0 as Float).to_radians(),
         ))
@@ -2952,11 +3402,15 @@ fn main() {
     //     spp: 32,
     //     max_depth: 3,
     // };
-    let mut integrator = BDPT {
-        spp: 32,
+    let mut integrator = nrc::CachedPathTracer {
+        spp: 128,
         max_depth: 3,
-        debug: false,
     };
+    // let mut integrator = BDPT {
+    //     spp: 32,
+    //     max_depth: 3,
+    //     debug: false,
+    // };
     // let mut integrator = SPPM {
     //     initial_radius: 0.1,
     //     iterations: 64,
@@ -2965,5 +3419,5 @@ fn main() {
     // };
     let film = integrator.render(&scene);
     let image = film.to_rgb_image();
-    image.save("out-bdpt.png").unwrap();
+    image.save("out-nrc.png").unwrap();
 }
