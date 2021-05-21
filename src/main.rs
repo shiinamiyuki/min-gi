@@ -2522,39 +2522,60 @@ mod nn {
             Self {}
         }
     }
-    pub trait VectorizedOptimizer : Clone{
-        fn step(&mut self, val:&mut [f32], grad: &[f32]);
+    pub trait VectorizedOptimizer: Clone {
+        type Scalar: OptimizerImpl;
+        fn step(&mut self, val: &mut [f32], grad: &[f32]);
+        fn new(opt: Self::Scalar, size: usize) -> Self;
     }
     pub trait OptimizerImpl: Default + Clone {
         fn step(&mut self, val: &mut f32, grad: f32);
-        // type Vectorized;
+        type Vectorized: VectorizedOptimizer;
     }
     #[derive(Clone)]
-    pub struct Optimizer<T, Impl: OptimizerImpl> {
+    pub struct Optimizer<T, Impl: VectorizedOptimizer> {
         // fn step(&mut self, val:&mut T, grad: &T);
         data: PhantomData<T>,
-        impl_: Vec<Impl>,
+        // impl_: Vec<Impl>,
+        impl_: Impl,
     }
-    impl<Impl: OptimizerImpl, const M: usize, const N: usize> Optimizer<na::SMatrix<f32, M, N>, Impl> {
-        fn new(opt: Impl) -> Self {
+    impl<Impl: VectorizedOptimizer, const M: usize, const N: usize> Optimizer<na::SMatrix<f32, M, N>, Impl> {
+        fn new(opt: Impl::Scalar) -> Self {
             Self {
                 data: PhantomData {},
-                impl_: vec![opt; M * N],
+                impl_: Impl::new(opt, M * N),
             }
         }
         fn step(&mut self, val: &mut na::SMatrix<f32, M, N>, grad: &na::SMatrix<f32, M, N>) {
-            assert!(self.impl_.len() == M * N);
-            // if self.impl_.len() != M * N {
-            //     self.impl_.resize(M * N, self.impl_[0].clone());
+            self.impl_.step(val.as_mut_slice(), grad.as_slice());
+            // assert!(self.impl_.len() == M * N);
+            // // if self.impl_.len() != M * N {
+            // //     self.impl_.resize(M * N, self.impl_[0].clone());
+            // // }
+            // for i in 0..(M * N) {
+            //     self.impl_[i].step(&mut (*val)[i], grad[i]);
             // }
-            for i in 0..(M * N) {
-                self.impl_[i].step(&mut (*val)[i], grad[i]);
-            }
         }
     }
     #[derive(Copy, Clone)]
     pub struct SGD {
         pub learning_rate: f32,
+    }
+    #[derive(Copy, Clone)]
+    pub struct VectorizedSGD {
+        learning_rate: f32,
+    }
+    impl VectorizedOptimizer for VectorizedSGD {
+        type Scalar = SGD;
+        fn new(opt: Self::Scalar, _size: usize) -> Self {
+            Self {
+                learning_rate: opt.learning_rate,
+            }
+        }
+        fn step(&mut self, val: &mut [f32], grad: &[f32]) {
+            for i in 0..val.len() {
+                val[i] -= self.learning_rate * grad[i];
+            }
+        }
     }
     impl Default for SGD {
         fn default() -> Self {
@@ -2564,6 +2585,7 @@ mod nn {
         }
     }
     impl OptimizerImpl for SGD {
+        type Vectorized = VectorizedSGD;
         fn step(&mut self, val: &mut f32, grad: f32) {
             *val -= self.learning_rate * grad;
         }
@@ -2573,6 +2595,30 @@ mod nn {
         pub a: f32,
         pub v: f32,
         pub learning_rate: f32,
+    }
+    #[derive(Clone)]
+    pub struct VectorizedMomentum {
+        pub a: f32,
+        pub learning_rate: f32,
+        pub v: Vec<f32>,
+    }
+    impl VectorizedOptimizer for VectorizedMomentum {
+        type Scalar = Momentum;
+        fn step(&mut self, val: &mut [f32], grad: &[f32]) {
+            for i in 0..val.len() {
+                self.v[i] = self.a * self.v[i] + self.learning_rate * grad[i];
+            }
+            for i in 0..val.len() {
+                val[i] -= self.learning_rate * grad[i];
+            }
+        }
+        fn new(opt: Self::Scalar, size: usize) -> Self {
+            Self {
+                v: vec![0.0; size],
+                learning_rate: opt.learning_rate,
+                a: opt.a,
+            }
+        }
     }
     impl Default for Momentum {
         fn default() -> Self {
@@ -2584,42 +2630,44 @@ mod nn {
         }
     }
     impl OptimizerImpl for Momentum {
+        type Vectorized = VectorizedMomentum;
         fn step(&mut self, val: &mut f32, grad: f32) {
             self.v = self.a * self.v + self.learning_rate * grad;
             *val -= self.v;
         }
     }
-    #[derive(Copy, Clone)]
-    pub struct Batch<O: OptimizerImpl> {
-        pub opt: O,
-        pub batch_size: u32,
-        pub count: u32,
-        pub sum: f32,
-    }
-    impl<O: OptimizerImpl> Default for Batch<O> {
-        fn default() -> Self {
-            Batch {
-                opt: Default::default(),
-                batch_size: 1,
-                count: 0,
-                sum: 0.0,
-            }
-        }
-    }
-    impl<O: OptimizerImpl> OptimizerImpl for Batch<O> {
-        fn step(&mut self, val: &mut f32, grad: f32) {
-            // self.v = self.a * self.v + self.learning_rate * grad;
-            // *val -= self.v;
-            self.sum += grad;
-            self.count += 1;
-            if self.count >= self.batch_size {
-                let grad = self.sum / self.count as f32;
-                self.opt.step(val, grad);
-                self.sum = 0.0;
-                self.count = 0;
-            }
-        }
-    }
+    // #[derive(Copy, Clone)]
+    // pub struct Batch<O: OptimizerImpl> {
+    //     pub opt: O,
+    //     pub batch_size: u32,
+    //     pub count: u32,
+    //     pub sum: f32,
+    // }
+    // impl<O: OptimizerImpl> Default for Batch<O> {
+    //     fn default() -> Self {
+    //         Batch {
+    //             opt: Default::default(),
+    //             batch_size: 1,
+    //             count: 0,
+    //             sum: 0.0,
+    //         }
+    //     }
+    // }
+
+    // impl<O: OptimizerImpl> OptimizerImpl for Batch<O> {
+    //     fn step(&mut self, val: &mut f32, grad: f32) {
+    //         // self.v = self.a * self.v + self.learning_rate * grad;
+    //         // *val -= self.v;
+    //         self.sum += grad;
+    //         self.count += 1;
+    //         if self.count >= self.batch_size {
+    //             let grad = self.sum / self.count as f32;
+    //             self.opt.step(val, grad);
+    //             self.sum = 0.0;
+    //             self.count = 0;
+    //         }
+    //     }
+    // }
     #[derive(Copy, Clone)]
     pub struct Adam {
         pub learning_rate: f32,
@@ -2628,6 +2676,44 @@ mod nn {
         pub beta1: f64,
         pub beta2: f64,
         pub t: usize,
+    }
+    #[derive(Clone)]
+    pub struct VectorizedAdam {
+        pub learning_rate: f32,
+        pub m: Vec<f64>,
+        pub v: Vec<f64>,
+        pub beta1: f64,
+        pub beta2: f64,
+        pub t: usize,
+    }
+    impl VectorizedOptimizer for VectorizedAdam {
+        type Scalar = Adam;
+        fn new(opt: Self::Scalar, size: usize) -> Self {
+            Self {
+                learning_rate:opt.learning_rate,
+                m:vec![0.0;size],
+                v:vec![0.0;size],
+                beta1:opt.beta1,
+                beta2:opt.beta2,
+                t:0
+            }
+        }
+        fn step(&mut self, val: &mut [f32], grad: &[f32]) {
+            self.t += 1;
+            // *val -= self.learning_rate * grad;
+            for i in 0..val.len() {
+                self.m[i] = self.beta1 * self.m[i] + (1.0 - self.beta1) * grad[i] as f64;
+            }
+            for i in 0..val.len() {
+                self.v[i] =
+                    self.beta2 * self.v[i] + (1.0 - self.beta2) * (grad[i] as f64 * grad[i] as f64);
+            }
+            for i in 0..val.len() {
+                let m_tilde = self.m[i] / (1.0 - self.beta1.powf(self.t as f64));
+                let v_tilde = self.v[i] / (1.0 - self.beta2.powf(self.t as f64));
+                val[i] -= self.learning_rate * (m_tilde / (v_tilde.sqrt() + 1e-8f64)) as f32;
+            }
+        }
     }
     impl Default for Adam {
         fn default() -> Self {
@@ -2642,6 +2728,7 @@ mod nn {
         }
     }
     impl OptimizerImpl for Adam {
+        type Vectorized = VectorizedAdam;
         fn step(&mut self, val: &mut f32, grad: f32) {
             let grad = grad as f64;
             self.t += 1;
@@ -2713,7 +2800,7 @@ mod nn {
             }
         }
         #[derive(Clone)]
-        pub struct Linear<Opt:OptimizerImpl, const I: usize, const O: usize> {
+        pub struct Linear<Opt: VectorizedOptimizer, const I: usize, const O: usize> {
             pub weights: na::SMatrix<f32, O, I>,
             pub bias: na::SVector<f32, O>,
             pub weights_opt: Optimizer<na::SMatrix<f32, O, I>, Opt>,
@@ -2721,9 +2808,9 @@ mod nn {
         }
         impl<Opt, const I: usize, const O: usize> Linear<Opt, I, O>
         where
-            Opt: OptimizerImpl,
+            Opt: VectorizedOptimizer,
         {
-            pub fn new(opt: Opt) -> Self {
+            pub fn new(opt: Opt::Scalar) -> Self {
                 use rand::distributions::Distribution;
                 use rand::Rng;
                 use statrs::distribution::Normal;
@@ -2742,7 +2829,7 @@ mod nn {
         }
         impl<Opt, const I: usize, const O: usize> Module<I, O> for Linear<Opt, I, O>
         where
-            Opt: OptimizerImpl,
+            Opt: VectorizedOptimizer,
         {
             type Temp = (); //na::SVector<f32, O>;
             fn create_temp(&self) -> Self::Temp {}
@@ -2770,15 +2857,15 @@ mod nn {
             }
         }
         #[derive(Clone)]
-        pub struct Dense<F: ActivationFunction, Opt:OptimizerImpl, const I: usize, const O: usize> {
+        pub struct Dense<F: ActivationFunction, Opt: VectorizedOptimizer, const I: usize, const O: usize> {
             pub linear: Linear<Opt, I, O>,
             pub act: Activation<F>,
         }
         impl<F: ActivationFunction, Opt, const I: usize, const O: usize> Dense<F, Opt, I, O>
         where
-            Opt: OptimizerImpl,
+            Opt: VectorizedOptimizer,
         {
-            pub fn new(opt: Opt) -> Self {
+            pub fn new(opt: Opt::Scalar) -> Self {
                 Self {
                     linear: Linear::new(opt.clone()),
                     act: Activation { f: F::new() },
@@ -2788,7 +2875,7 @@ mod nn {
         impl<F: ActivationFunction, Opt, const I: usize, const O: usize> Module<I, O>
             for Dense<F, Opt, I, O>
         where
-            Opt: OptimizerImpl,
+            Opt: VectorizedOptimizer,
         {
             type Temp = na::SVector<f32, O>;
             fn create_temp(&self) -> Self::Temp {
@@ -2963,7 +3050,7 @@ mod nn {
                     {get_last!( $($rest), +)}
                 >;
             impl $name {
-                pub fn new(o:$opt)->Self {
+                pub fn new(o:<$opt as crate::nn::VectorizedOptimizer>::Scalar)->Self {
                     Self{m:create_mlp_helper!(o, $act, $opt, $dim1, $($rest), +)}
                 }
             }
@@ -3046,7 +3133,7 @@ mod nrc {
     create_mlp!(
         NRCModel,
         Relu,
-        SGD,
+        VectorizedSGD,
         { 5 * FEATURE_SIZE * 2 + 5 },
         64,
         64,
@@ -3400,7 +3487,7 @@ mod tests {
     use super::nn::*;
     use nalgebra as na;
     use rand::Rng;
-    create_mlp!(Net, Relu, Adam, 2, 8, 2);
+    create_mlp!(Net, Relu, VectorizedMomentum, 2, 8, 2);
     #[test]
     fn test_mlp() {
         // #[macro_use(nn::mlp)]
@@ -3449,12 +3536,15 @@ mod test_image {
     use image::GenericImageView;
     use nalgebra as na;
     use rand::Rng;
-    create_mlp!(Net, Relu, Adam, { 2 * 8 * 2 + 2 }, 64, 64, 64, 64, 64, 3);
+    create_mlp!(Net, Relu, VectorizedMomentum, { 2 * 8 * 2 + 2 }, 64, 64, 64, 64, 64, 3);
 
     position_encoding_func!(position_encoding, 2, 8);
 
     pub fn test() {
-        let opt = Adam { learning_rate: 0.01,..Default::default() };
+        let opt = Momentum {
+            learning_rate: 0.01,
+            ..Default::default()
+        };
         let mut net = Net::new(opt);
         let img = image::open("test.jpg").unwrap();
         let imgx = img.width();
