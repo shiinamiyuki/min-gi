@@ -1,9 +1,14 @@
 use glm::vec2;
 use glm::vec3;
+use mimalloc::MiMalloc;
 pub use nalgebra as na;
 pub use nalgebra_glm as glm;
 use rand::Rng;
 use rayon::prelude::*;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 #[macro_use]
 extern crate bitflags;
 use std::{
@@ -420,7 +425,7 @@ pub fn uniform_sphere_pdf() -> Float {
 }
 pub fn dir_to_spherical(v: &Vec3) -> Vec2 {
     let theta = v.y.acos();
-    let phi = (v.z / v.x).atan();
+    let phi = (v.z / v.x).atan() + PI;
     vec2(theta, phi)
 }
 pub fn parallel_for<F: Fn(usize) -> () + Sync>(count: usize, chunk_size: usize, f: F) {
@@ -2517,11 +2522,15 @@ mod nn {
             Self {}
         }
     }
+    pub trait VectorizedOptimizer : Clone{
+        fn step(&mut self, val:&mut [f32], grad: &[f32]);
+    }
     pub trait OptimizerImpl: Default + Clone {
         fn step(&mut self, val: &mut f32, grad: f32);
+        // type Vectorized;
     }
     #[derive(Clone)]
-    pub struct Optimizer<T, Impl> {
+    pub struct Optimizer<T, Impl: OptimizerImpl> {
         // fn step(&mut self, val:&mut T, grad: &T);
         data: PhantomData<T>,
         impl_: Vec<Impl>,
@@ -2704,7 +2713,7 @@ mod nn {
             }
         }
         #[derive(Clone)]
-        pub struct Linear<Opt, const I: usize, const O: usize> {
+        pub struct Linear<Opt:OptimizerImpl, const I: usize, const O: usize> {
             pub weights: na::SMatrix<f32, O, I>,
             pub bias: na::SVector<f32, O>,
             pub weights_opt: Optimizer<na::SMatrix<f32, O, I>, Opt>,
@@ -2761,7 +2770,7 @@ mod nn {
             }
         }
         #[derive(Clone)]
-        pub struct Dense<F: ActivationFunction, Opt, const I: usize, const O: usize> {
+        pub struct Dense<F: ActivationFunction, Opt:OptimizerImpl, const I: usize, const O: usize> {
             pub linear: Linear<Opt, I, O>,
             pub act: Activation<F>,
         }
@@ -2912,7 +2921,7 @@ mod nn {
         ($opt_v:expr, $act:ty, $opt:ty, $dim1:expr, $dim2:expr)=>{
             crate::nn::mlp::Linear::<$opt, $dim1, $dim2>::new($opt_v)
         };
-        ($opt_v:expr,$act:ty, $opt:ty,  $dim1:expr,$dim2:expr, $($rest:expr), *)=>{
+        ($opt_v:expr,$act:ty, $opt:ty,  $dim1:expr,$dim2:expr, $($rest:expr), +)=>{
 
             crate::nn::mlp::CombineModules{
                    a: crate::nn::mlp::Dense::<$act, $opt, $dim1, $dim2>::new($opt_v),
@@ -2961,6 +2970,24 @@ mod nn {
 
     }
    }
+
+    #[macro_export]
+    macro_rules! position_encoding_func {
+        ($name:ident, $N:expr, $E:expr) => {
+            fn $name(v: &na::SVector<f32, $N>) -> na::SVector<f32, { $N + $N * $E * 2 }> {
+                let mut u: na::SVector<f32, { $N + $N * $E * 2 }> = na::zero();
+                for i in 0..$N {
+                    for j in 0..$E {
+                        let feq = 2.0f32.powi(j as i32);
+                        u[i * $E + j] = (v[i] * feq as f32).sin();
+                        u[i * $E + j + $N * $E] = (v[i] * feq as f32).cos();
+                    }
+                    u[$N * $E * 2 + i] = v[i];
+                }
+                u
+            }
+        };
+    }
 }
 mod nrc {
     use super::*;
@@ -2972,31 +2999,63 @@ mod nrc {
     use rand::Rng;
     use statrs::distribution::Normal;
 
+    const FEATURE_SIZE: usize = 6;
+    // type FeatureMat = na::SMatrix<f32, { FEATURE_SIZE }, 5>;
+    // type FeatureVec1 = na::SVector<f32, { FEATURE_SIZE }>;
+    type FeatureVec = na::SVector<f32, { 5 * FEATURE_SIZE * 2 + 5 }>;
     // input: [x y z theta phi]
-    #[allow(non_snake_case)]
-    struct PositionEncoding {
-        B: na::Matrix5<f32>,
-    }
+    // #[allow(non_snake_case)]
+    // struct PositionEncoding {
+    //     B: FeatureMat,
+    // }
+    // impl PositionEncoding {
+    //     fn new() -> Self {
+    //         let mut rng = rand::thread_rng();
+    //         let n = Normal::new(0.0, 1.0).unwrap();
+    //         PositionEncoding {
+    //             B: na::zero::<FeatureMat>().map(|_| (n.sample(&mut rng) * 2.0) as f32),
+    //         }
+    //     }
+    //     #[allow(non_snake_case)]
+    //     fn encode(&self, v: &na::Vector5<f32>) -> FeatureVec {
+    //         let A: FeatureVec1 = (2.0 * (PI as f32) * self.B * v).map(|x| x.cos());
+    //         let B: FeatureVec1 = (2.0 * (PI as f32) * self.B * v).map(|x| x.sin());
+    //         let M: FeatureVec = FeatureVec::from_iterator(A.iter().chain(B.iter()).map(|x| *x));
+    //         M
+    //     }
+    // }
+
+    struct PositionEncoding {}
     impl PositionEncoding {
         fn new() -> Self {
-            let mut rng = rand::thread_rng();
-            let n = Normal::new(0.0, 1.0).unwrap();
-            PositionEncoding {
-                B: na::zero::<na::Matrix5<f32>>().map(|_| n.sample(&mut rng) as f32),
-            }
+            Self {}
         }
-        #[allow(non_snake_case)]
-        fn encode(&self, v: &na::Vector5<f32>) -> na::SVector<f32, 10> {
-            let A: na::Vector5<f32> = (2.0 * (PI as f32) * self.B * v).map(|x| x.cos());
-            let B: na::Vector5<f32> = (2.0 * (PI as f32) * self.B * v).map(|x| x.sin());
-            let M: na::SVector<f32, 10> =
-                na::SVector::<f32, 10>::from_iterator(A.iter().chain(B.iter()).map(|x| *x));
-            M
+        fn encode(&self, v: &na::Vector5<f32>) -> FeatureVec {
+            let mut u: FeatureVec = na::zero();
+            for i in 0..5 {
+                for j in 0..FEATURE_SIZE {
+                    let feq = 2.0f32.powf(j as f32);
+                    u[i * FEATURE_SIZE + j] = (v[i] * feq as f32).sin();
+                    u[i * FEATURE_SIZE + j + 5 * FEATURE_SIZE] = (v[i] * feq as f32).cos();
+                }
+                u[5 * FEATURE_SIZE * 2 + i] = v[i];
+            }
+            u
         }
     }
-    create_mlp!(NRCModel, Relu, Batch<SGD>, 10, 64, 64, 64, 64, 64, 64, {
-        Spectrum::N_SAMPLES
-    });
+    create_mlp!(
+        NRCModel,
+        Relu,
+        SGD,
+        { 5 * FEATURE_SIZE * 2 + 5 },
+        64,
+        64,
+        64,
+        64,
+        64,
+        64,
+        { Spectrum::N_SAMPLES }
+    );
 
     struct RadianceCache {
         model: NRCModel,
@@ -3004,7 +3063,7 @@ mod nrc {
         bound: Bounds3f,
     }
     impl RadianceCache {
-        fn new(opt: Batch<SGD>) -> Self {
+        fn new(opt: SGD) -> Self {
             Self {
                 model: NRCModel::new(opt),
                 encoding: PositionEncoding::new(),
@@ -3014,27 +3073,26 @@ mod nrc {
                 },
             }
         }
-        fn infer(&self, x: &Vec3, dir: &Vec2) -> Spectrum {
+        fn infer(&self, x: &Vec3, dir: &Vec2) -> Option<Spectrum> {
+            if !self.bound.contains(&x) {
+                return None;
+            }
             let v: na::SVector<f32, 5> = na::SVector::from_iterator(
-                self.bound
-                    .offset(&x)
-                    .into_iter()
-                    .chain(dir.into_iter())
-                    .map(|x| *x as f32),
+                // self.bound
+                //     .offset(&x)
+                x.into_iter().chain(dir.into_iter()).map(|x| *x as f32),
             );
             let s: Spectrum = self.model.infer(&self.encoding.encode(&v)).into();
-            s
+            Some(s)
         }
         fn train(&mut self, x: &Vec3, dir: &Vec2, target: &Spectrum) {
             if !self.bound.contains(&x) {
                 return;
             }
             let v: na::SVector<f32, 5> = na::SVector::from_iterator(
-                self.bound
-                    .offset(&x)
-                    .into_iter()
-                    .chain(dir.into_iter())
-                    .map(|x| *x as f32),
+                // self.bound
+                //     .offset(&x)
+                x.into_iter().chain(dir.into_iter()).map(|x| *x as f32),
             );
             let _loss = self
                 .model
@@ -3044,6 +3102,7 @@ mod nrc {
     }
     pub struct CachedPathTracer {
         pub spp: u32,
+        pub training_samples: u32,
         pub max_depth: u32,
     }
     #[derive(Copy, Clone)]
@@ -3067,6 +3126,8 @@ mod nrc {
             path: &mut Vec<Vertex>,
             path_tmp: &mut Vec<VertexTemp>,
             training: bool,
+            enable_cache: bool,
+            use_cache_after: u32,
             cache: &RwLock<RadianceCache>,
         ) -> Spectrum {
             let mut li = Spectrum::zero();
@@ -3075,17 +3136,17 @@ mod nrc {
             let mut depth = 0;
             path_tmp.clear();
             path.clear();
-            if training {
-                path_tmp.push(VertexTemp {
-                    beta: Spectrum::one(),
-                    li: Spectrum::zero(),
-                });
-                path.push(Vertex {
-                    x: ray.o,
-                    dir: dir_to_spherical(&ray.d),
-                    radiance: Spectrum::zero(),
-                });
-            }
+            // if training {
+            //     path_tmp.push(VertexTemp {
+            //         beta: Spectrum::one(),
+            //         li: Spectrum::zero(),
+            //     });
+            //     path.push(Vertex {
+            //         x: ray.o,
+            //         dir: dir_to_spherical(&ray.d),
+            //         radiance: Spectrum::zero(),
+            //     });
+            // }
 
             let accumulate_radiance = {
                 let p_li = &mut li as *mut Spectrum;
@@ -3159,20 +3220,32 @@ mod nrc {
 
                     if let Some(bsdf_sample) = bsdf.sample(&sampler.next2d(), &wo) {
                         let wi = &bsdf_sample.wi;
-                        // if training {
-                        //     path_tmp.push(VertexTemp {
-                        //         beta: Spectrum::one(),
-                        //         li: Spectrum::zero(),
-                        //     });
-                        //     path.push(Vertex {
-                        //         x: p,
-                        //         dir: dir_to_spherical(wi),
-                        //         radiance: Spectrum::zero(),
-                        //     });
-                        // }
-
                         ray = Ray::spawn(&p, wi).offset_along_normal(&ng);
                         accumulate_beta(bsdf_sample.f * glm::dot(wi, &ng).abs() / bsdf_sample.pdf);
+                        if training {
+                            path_tmp.push(VertexTemp {
+                                beta: Spectrum::one(),
+                                li: Spectrum::zero(),
+                            });
+                            path.push(Vertex {
+                                x: p,
+                                dir: dir_to_spherical(wi),
+                                radiance: Spectrum::zero(),
+                            });
+                        }
+                        let cache_enable_depth = if training {
+                            use_cache_after + 2
+                        } else {
+                            use_cache_after
+                        };
+
+                        if enable_cache && depth >= cache_enable_depth {
+                            let cache = cache.read().unwrap();
+                            if let Some(radiance) = cache.infer(&p, &dir_to_spherical(wi)) {
+                                accumulate_radiance(radiance);
+                                break;
+                            }
+                        }
                     } else {
                         break;
                     }
@@ -3199,11 +3272,9 @@ mod nrc {
         fn render(&mut self, scene: &Scene) -> Self::Output {
             let npixels = (scene.camera.resolution().x * scene.camera.resolution().y) as usize;
             let film = Film::new(&scene.camera.resolution());
-            let opt = Batch {
-                opt: SGD {
-                    learning_rate: 0.01,
-                },
-                batch_size: 8,
+            let opt = SGD {
+                learning_rate: 0.05,
+
                 ..Default::default()
             };
             let cache = RwLock::new(RadianceCache::new(opt));
@@ -3218,7 +3289,7 @@ mod nrc {
                 };
                 rayon::current_num_threads()
             ];
-            for _ in 0..self.spp {
+            for iter in 0..self.training_samples {
                 let p_samplers = &UnsafePointer::new(&mut samplers as *mut Vec<Box<dyn Sampler>>);
                 let p_per_thread_data =
                     &UnsafePointer::new(&mut per_thread_data as *mut Vec<PerThreadData>);
@@ -3236,7 +3307,10 @@ mod nrc {
                     let (ray, _ray_weight) = scene.camera.generate_ray(&pixel, sampler.as_mut());
                     let path = &mut thread_data.path;
                     let path_tmp = &mut thread_data.path_tmp;
-                    let training = (x % 8 == 0) && (y % 8 == 0);
+                    let training = ((x + iter) % 8 == 0) && ((y + iter / 8) % 8 == 0);
+                    if !training {
+                        return;
+                    }
                     let _li = self.li(
                         scene,
                         ray,
@@ -3245,6 +3319,8 @@ mod nrc {
                         path,
                         path_tmp,
                         training,
+                        iter >= 4,
+                        1,
                         &cache,
                     );
                     if training {
@@ -3257,27 +3333,61 @@ mod nrc {
                     }
                 });
             }
-            println!("visiualizing");
-            parallel_for(npixels, 256, |id| {
-                let mut sampler = PCGSampler { rng: PCG::new(id) };
-                let x = (id as u32) % scene.camera.resolution().x;
-                let y = (id as u32) / scene.camera.resolution().x;
-                let pixel = uvec2(x, y);
-                let (ray, _ray_weight) = scene.camera.generate_ray(&pixel, &mut sampler);
-                let lk = cache.read().unwrap();
-                let cache = &*lk;
-                // let li = cache.infer(&ray.o, &dir_to_spherical(&ray.d));
-                let mut li = Spectrum::zero();
-                if let Some(isct) = scene.shape.intersect(&ray) {
-                    let p = ray.o; //ray.at(isct.t * 0.9);
-                    li = cache.infer(&p, &dir_to_spherical(&ray.d));
-                    // let n = isct.ng;
-                    // let frame = Frame::from_normal(&n);
-                    // f
-                    // println!("{}", li.samples);
-                }
-                film.add_sample(&uvec2(x, y), &li, 1.0);
-            });
+            for iter in 0..self.spp {
+                let p_samplers = &UnsafePointer::new(&mut samplers as *mut Vec<Box<dyn Sampler>>);
+                let p_per_thread_data =
+                    &UnsafePointer::new(&mut per_thread_data as *mut Vec<PerThreadData>);
+                parallel_for(npixels, 256, |id| {
+                    let samplers = unsafe { p_samplers.as_mut().unwrap() };
+                    let thread_data = unsafe {
+                        &mut (p_per_thread_data.as_mut().unwrap())
+                            [rayon::current_thread_index().unwrap()]
+                    };
+                    let sampler = &mut samplers[id];
+                    // let mut sampler = PCGSampler { rng: PCG::new(id) };
+                    let x = (id as u32) % scene.camera.resolution().x;
+                    let y = (id as u32) / scene.camera.resolution().x;
+                    let pixel = uvec2(x, y);
+                    let (ray, _ray_weight) = scene.camera.generate_ray(&pixel, sampler.as_mut());
+                    let path = &mut thread_data.path;
+                    let path_tmp = &mut thread_data.path_tmp;
+                    let training = false;
+                    let li = self.li(
+                        scene,
+                        ray,
+                        sampler.as_mut(),
+                        self.max_depth,
+                        path,
+                        path_tmp,
+                        training,
+                        true,
+                        1,
+                        &cache,
+                    );
+                    film.add_sample(&uvec2(x, y), &li, 1.0);
+                });
+            }
+            // println!("visiualizing");
+            // parallel_for(npixels, 256, |id| {
+            //     let mut sampler = PCGSampler { rng: PCG::new(id) };
+            //     let x = (id as u32) % scene.camera.resolution().x;
+            //     let y = (id as u32) / scene.camera.resolution().x;
+            //     let pixel = uvec2(x, y);
+            //     let (ray, _ray_weight) = scene.camera.generate_ray(&pixel, &mut sampler);
+            //     let lk = cache.read().unwrap();
+            //     let cache = &*lk;
+            //     // let li = cache.infer(&ray.o, &dir_to_spherical(&ray.d));
+            //     let mut li = Spectrum::zero();
+            //     if let Some(isct) = scene.shape.intersect(&ray) {
+            //         let p = ray.o; //ray.at(isct.t * 0.9);
+            //         li = cache.infer(&p, &dir_to_spherical(&ray.d));
+            //         // let n = isct.ng;
+            //         // let frame = Frame::from_normal(&n);
+            //         // f
+            //         // println!("{}", li.samples);
+            //     }
+            //     film.add_sample(&uvec2(x, y), &li, 1.0);
+            // });
             film
         }
     }
@@ -3290,7 +3400,7 @@ mod tests {
     use super::nn::*;
     use nalgebra as na;
     use rand::Rng;
-    create_mlp!(Net, Relu, Momentum, 2, 8, 2);
+    create_mlp!(Net, Relu, Adam, 2, 8, 2);
     #[test]
     fn test_mlp() {
         // #[macro_use(nn::mlp)]
@@ -3332,7 +3442,49 @@ mod tests {
         // println!("{} {}", net.m.b.weights, net.m.b.bias);
     }
 }
+mod test_image {
+    use super::nn::mlp::CombineModules;
+    // use nn::mlp
+    use super::nn::*;
+    use image::GenericImageView;
+    use nalgebra as na;
+    use rand::Rng;
+    create_mlp!(Net, Relu, Adam, { 2 * 8 * 2 + 2 }, 64, 64, 64, 64, 64, 3);
+
+    position_encoding_func!(position_encoding, 2, 8);
+
+    pub fn test() {
+        let opt = Adam { learning_rate: 0.01,..Default::default() };
+        let mut net = Net::new(opt);
+        let img = image::open("test.jpg").unwrap();
+        let imgx = img.width();
+        let imgy = img.height();
+        let get_pixel = |x: na::Vector2<f32>| -> na::Vector3<f32> {
+            let px = img.get_pixel((x[0] * imgx as f32) as u32, (x[1] * imgy as f32) as u32);
+            na::Vector3::new(px[0] as f32, px[1] as f32, px[2] as f32) / 255.0
+        };
+        let mut rng = rand::thread_rng();
+        for iter in 0..1000 {
+            let x = na::zero::<na::SVector<f32, 2>>().map(|_| rng.gen::<f32>());
+            let target = get_pixel(x);
+            let loss = net.train(&position_encoding(&x), target);
+            if iter % 1000 == 0 {
+                // println!("training on {} {}; {}",&x, f(&x), y);
+                println!("{} {}", iter, loss);
+            }
+        }
+        let out = image::ImageBuffer::from_fn(imgx, imgy, |x, y| {
+            let x = na::Vector2::<f32>::new(x as f32 / imgx as f32, y as f32 / imgy as f32);
+            let color = net.infer(&position_encoding(&x)) * 255.0;
+            image::Rgb([color[0] as u8, color[1] as u8, color[2] as u8])
+        });
+        out.save("out.jpg").unwrap();
+    }
+}
 fn main() {
+    test_image::test();
+}
+fn main0() {
     // rayon::ThreadPoolBuilder::new()
     //     .num_threads(1)
     //     .build_global()
@@ -3399,11 +3551,12 @@ fn main() {
         light_distr: Arc::new(UniformLightDistribution::new(lights.clone())),
     };
     // let mut integrator = PathTracer {
-    //     spp: 32,
+    //     spp: 16,
     //     max_depth: 3,
     // };
     let mut integrator = nrc::CachedPathTracer {
-        spp: 128,
+        spp: 16,
+        training_samples: 256,
         max_depth: 3,
     };
     // let mut integrator = BDPT {
