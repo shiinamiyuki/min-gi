@@ -460,10 +460,17 @@ pub struct BSDFSample {
     pub f: Spectrum,
     pub pdf: Float,
 }
+#[derive(Clone, Copy)]
+pub struct BSDFInfo {
+    pub albedo: Spectrum,
+    // pub roughness:Float,
+}
+
 pub trait BSDF: Sync + Send {
     fn evaluate(&self, wo: &Vec3, wi: &Vec3) -> Spectrum;
     fn evaluate_pdf(&self, wo: &Vec3, wi: &Vec3) -> Float;
     fn sample(&self, u: &Vec2, wo: &Vec3) -> Option<BSDFSample>;
+    fn info(&self) -> BSDFInfo;
 }
 pub trait Shape: Sync + Send {
     fn intersect<'a>(&'a self, ray: &Ray) -> Option<Intersection<'a>>;
@@ -1139,6 +1146,11 @@ impl BSDF for NullBSDF {
     fn sample(&self, u: &Vec2, wo: &Vec3) -> Option<BSDFSample> {
         None
     }
+    fn info(&self) -> BSDFInfo {
+        BSDFInfo {
+            albedo: Spectrum::zero(),
+        }
+    }
 }
 struct PCG {
     state: usize,
@@ -1220,6 +1232,11 @@ struct DiffuseBSDF {
     reflecance: Spectrum,
 }
 impl BSDF for DiffuseBSDF {
+    fn info(&self) -> BSDFInfo {
+        BSDFInfo {
+            albedo: self.reflecance,
+        }
+    }
     fn evaluate(&self, wo: &Vec3, wi: &Vec3) -> Spectrum {
         if Frame::same_hemisphere(&wo, &wi) {
             self.reflecance * FRAC_1_PI
@@ -2522,8 +2539,8 @@ mod nn {
             Self {}
         }
     }
-    pub trait VectorizedOptimizer : Clone{
-        fn step(&mut self, val:&mut [f32], grad: &[f32]);
+    pub trait VectorizedOptimizer: Clone {
+        fn step(&mut self, val: &mut [f32], grad: &[f32]);
     }
     pub trait OptimizerImpl: Default + Clone {
         fn step(&mut self, val: &mut f32, grad: f32);
@@ -2565,7 +2582,7 @@ mod nn {
     }
     impl OptimizerImpl for SGD {
         fn step(&mut self, val: &mut f32, grad: f32) {
-            *val -= self.learning_rate * grad;
+            *val -= self.learning_rate * grad.max(-100.0).min(100.0);
         }
     }
     #[derive(Copy, Clone)]
@@ -2713,7 +2730,7 @@ mod nn {
             }
         }
         #[derive(Clone)]
-        pub struct Linear<Opt:OptimizerImpl, const I: usize, const O: usize> {
+        pub struct Linear<Opt: OptimizerImpl, const I: usize, const O: usize> {
             pub weights: na::SMatrix<f32, O, I>,
             pub bias: na::SVector<f32, O>,
             pub weights_opt: Optimizer<na::SMatrix<f32, O, I>, Opt>,
@@ -2770,7 +2787,7 @@ mod nn {
             }
         }
         #[derive(Clone)]
-        pub struct Dense<F: ActivationFunction, Opt:OptimizerImpl, const I: usize, const O: usize> {
+        pub struct Dense<F: ActivationFunction, Opt: OptimizerImpl, const I: usize, const O: usize> {
             pub linear: Linear<Opt, I, O>,
             pub act: Activation<F>,
         }
@@ -2979,8 +2996,8 @@ mod nn {
                 for i in 0..$N {
                     for j in 0..$E {
                         let feq = 2.0f32.powi(j as i32);
-                        u[i * $E + j] = (v[i] * feq as f32).sin();
-                        u[i * $E + j + $N * $E] = (v[i] * feq as f32).cos();
+                        u[i * $E + j] = (v[i] * feq).sin();
+                        u[i * $E + j + $N * $E] = (v[i] * feq).cos();
                     }
                     u[$N * $E * 2 + i] = v[i];
                 }
@@ -3000,103 +3017,73 @@ mod nrc {
     use statrs::distribution::Normal;
 
     const FEATURE_SIZE: usize = 6;
+    const INPUT_SIZE: usize = 3 + 2 + Spectrum::N_SAMPLES + 3;
     // type FeatureMat = na::SMatrix<f32, { FEATURE_SIZE }, 5>;
     // type FeatureVec1 = na::SVector<f32, { FEATURE_SIZE }>;
-    type FeatureVec = na::SVector<f32, { 5 * FEATURE_SIZE * 2 + 5 }>;
-    // input: [x y z theta phi]
-    // #[allow(non_snake_case)]
-    // struct PositionEncoding {
-    //     B: FeatureMat,
-    // }
-    // impl PositionEncoding {
-    //     fn new() -> Self {
-    //         let mut rng = rand::thread_rng();
-    //         let n = Normal::new(0.0, 1.0).unwrap();
-    //         PositionEncoding {
-    //             B: na::zero::<FeatureMat>().map(|_| (n.sample(&mut rng) * 2.0) as f32),
-    //         }
-    //     }
-    //     #[allow(non_snake_case)]
-    //     fn encode(&self, v: &na::Vector5<f32>) -> FeatureVec {
-    //         let A: FeatureVec1 = (2.0 * (PI as f32) * self.B * v).map(|x| x.cos());
-    //         let B: FeatureVec1 = (2.0 * (PI as f32) * self.B * v).map(|x| x.sin());
-    //         let M: FeatureVec = FeatureVec::from_iterator(A.iter().chain(B.iter()).map(|x| *x));
-    //         M
-    //     }
-    // }
+    type InputVec = na::SVector<f32, { INPUT_SIZE }>;
+    type FeatureVec = na::SVector<f32, { INPUT_SIZE * FEATURE_SIZE * 2 + INPUT_SIZE }>;
 
-    struct PositionEncoding {}
-    impl PositionEncoding {
-        fn new() -> Self {
-            Self {}
-        }
-        fn encode(&self, v: &na::Vector5<f32>) -> FeatureVec {
-            let mut u: FeatureVec = na::zero();
-            for i in 0..5 {
-                for j in 0..FEATURE_SIZE {
-                    let feq = 2.0f32.powf(j as f32);
-                    u[i * FEATURE_SIZE + j] = (v[i] * feq as f32).sin();
-                    u[i * FEATURE_SIZE + j + 5 * FEATURE_SIZE] = (v[i] * feq as f32).cos();
-                }
-                u[5 * FEATURE_SIZE * 2 + i] = v[i];
-            }
-            u
-        }
-    }
     create_mlp!(
         NRCModel,
         Relu,
         SGD,
-        { 5 * FEATURE_SIZE * 2 + 5 },
+        { INPUT_SIZE * FEATURE_SIZE * 2 + INPUT_SIZE },
         64,
         64,
         64,
-        64,
-        64,
-        64,
+        // 64,
+        // 64,
+        // 64,
         { Spectrum::N_SAMPLES }
     );
 
+    position_encoding_func!(position_encoder, INPUT_SIZE, FEATURE_SIZE);
     struct RadianceCache {
         model: NRCModel,
-        encoding: PositionEncoding,
         bound: Bounds3f,
+    }
+    #[derive(Clone, Copy)]
+    struct QueryRecord {
+        n: Vec3,
+        info: BSDFInfo,
+        x: Vec3,
+        dir: Vec2,
     }
     impl RadianceCache {
         fn new(opt: SGD) -> Self {
             Self {
                 model: NRCModel::new(opt),
-                encoding: PositionEncoding::new(),
                 bound: Bounds3f {
                     min: vec3(1.0, 1.0, 1.0) * -20.0,
                     max: vec3(1.0, 1.0, 1.0) * 20.0,
                 },
             }
         }
-        fn infer(&self, x: &Vec3, dir: &Vec2) -> Option<Spectrum> {
-            if !self.bound.contains(&x) {
+        fn get_input_vec(r: &QueryRecord) -> InputVec {
+            InputVec::from_iterator(
+                r.x.into_iter()
+                    .chain(r.dir.into_iter())
+                    .chain(r.n.into_iter())
+                    .chain(r.info.albedo.samples.into_iter())
+                    .map(|x| *x as f32),
+            )
+        }
+        fn infer(&self, r: &QueryRecord) -> Option<Spectrum> {
+            if !self.bound.contains(&r.x) {
                 return None;
             }
-            let v: na::SVector<f32, 5> = na::SVector::from_iterator(
-                // self.bound
-                //     .offset(&x)
-                x.into_iter().chain(dir.into_iter()).map(|x| *x as f32),
-            );
-            let s: Spectrum = self.model.infer(&self.encoding.encode(&v)).into();
+            let v = Self::get_input_vec(r);
+            let s: Spectrum = self.model.infer(&position_encoder(&v)).into();
             Some(s)
         }
-        fn train(&mut self, x: &Vec3, dir: &Vec2, target: &Spectrum) {
-            if !self.bound.contains(&x) {
+        fn train(&mut self, r: &QueryRecord, target: &Spectrum) {
+            if !self.bound.contains(&r.x) {
                 return;
             }
-            let v: na::SVector<f32, 5> = na::SVector::from_iterator(
-                // self.bound
-                //     .offset(&x)
-                x.into_iter().chain(dir.into_iter()).map(|x| *x as f32),
-            );
+            let v = Self::get_input_vec(r);
             let _loss = self
                 .model
-                .train(&self.encoding.encode(&v), target.samples.cast::<f32>());
+                .train(&position_encoder(&v), target.samples.cast::<f32>());
             // println!("{} {}",v, _loss);
         }
     }
@@ -3109,6 +3096,8 @@ mod nrc {
     struct Vertex {
         x: Vec3,
         dir: Vec2,
+        info: BSDFInfo,
+        n: Vec3,
         radiance: Spectrum,
     }
     #[derive(Copy, Clone)]
@@ -3192,6 +3181,41 @@ mod nrc {
                         frame,
                         bsdf: opt_bsdf.unwrap(),
                     };
+                    if training {
+                        path_tmp.push(VertexTemp {
+                            beta: Spectrum::one(),
+                            li: Spectrum::zero(),
+                        });
+                        path.push(Vertex {
+                            x: p,
+                            n: ng,
+                            info: bsdf.bsdf.info(),
+                            dir: dir_to_spherical(&ray.d),
+                            radiance: Spectrum::zero(),
+                        });
+                    }
+                    {
+                        let cache_enable_depth = if training {
+                            use_cache_after + 2
+                        } else {
+                            use_cache_after
+                        };
+
+                        if enable_cache && depth >= cache_enable_depth {
+                            let cache = cache.read().unwrap();
+                            let record = QueryRecord {
+                                x: p,
+                                dir: dir_to_spherical(&ray.d),
+                                info: bsdf.bsdf.info(),
+                                n: ng,
+                            };
+                            if let Some(radiance) = cache.infer(&record) {
+                                accumulate_radiance(radiance);
+                                break;
+                            }
+                        }
+                    }
+
                     let wo = -ray.d;
                     if depth >= max_depth {
                         break;
@@ -3222,30 +3246,6 @@ mod nrc {
                         let wi = &bsdf_sample.wi;
                         ray = Ray::spawn(&p, wi).offset_along_normal(&ng);
                         accumulate_beta(bsdf_sample.f * glm::dot(wi, &ng).abs() / bsdf_sample.pdf);
-                        if training {
-                            path_tmp.push(VertexTemp {
-                                beta: Spectrum::one(),
-                                li: Spectrum::zero(),
-                            });
-                            path.push(Vertex {
-                                x: p,
-                                dir: dir_to_spherical(wi),
-                                radiance: Spectrum::zero(),
-                            });
-                        }
-                        let cache_enable_depth = if training {
-                            use_cache_after + 2
-                        } else {
-                            use_cache_after
-                        };
-
-                        if enable_cache && depth >= cache_enable_depth {
-                            let cache = cache.read().unwrap();
-                            if let Some(radiance) = cache.infer(&p, &dir_to_spherical(wi)) {
-                                accumulate_radiance(radiance);
-                                break;
-                            }
-                        }
                     } else {
                         break;
                     }
@@ -3273,7 +3273,7 @@ mod nrc {
             let npixels = (scene.camera.resolution().x * scene.camera.resolution().y) as usize;
             let film = Film::new(&scene.camera.resolution());
             let opt = SGD {
-                learning_rate: 0.05,
+                learning_rate: 0.003,
 
                 ..Default::default()
             };
@@ -3319,21 +3319,27 @@ mod nrc {
                         path,
                         path_tmp,
                         training,
-                        iter >= 4,
+                        false,
                         1,
                         &cache,
                     );
                     if training {
                         let mut lk = cache.write().unwrap();
                         let cache = &mut *lk;
-                        for vertex in path {
-                            vertex.dir.into_iter().for_each(|x| assert!(!x.is_nan()));
-                            cache.train(&vertex.x, &vertex.dir, &vertex.radiance);
+                        for vertex in path.iter() {
+                            // vertex.dir.into_iter().for_each(|x| assert!(!x.is_nan()));
+                            let record = QueryRecord {
+                                x: vertex.x,
+                                dir: vertex.dir,
+                                info: vertex.info,
+                                n: vertex.n,
+                            };
+                            cache.train(&record, &vertex.radiance);
                         }
                     }
                 });
             }
-            for iter in 0..self.spp {
+            {
                 let p_samplers = &UnsafePointer::new(&mut samplers as *mut Vec<Box<dyn Sampler>>);
                 let p_per_thread_data =
                     &UnsafePointer::new(&mut per_thread_data as *mut Vec<PerThreadData>);
@@ -3352,18 +3358,40 @@ mod nrc {
                     let path = &mut thread_data.path;
                     let path_tmp = &mut thread_data.path_tmp;
                     let training = false;
-                    let li = self.li(
-                        scene,
-                        ray,
-                        sampler.as_mut(),
-                        self.max_depth,
-                        path,
-                        path_tmp,
-                        training,
-                        true,
-                        1,
-                        &cache,
-                    );
+                    // let li = self.li(
+                    //     scene,
+                    //     ray,
+                    //     sampler.as_mut(),
+                    //     self.max_depth,
+                    //     path,
+                    //     path_tmp,
+                    //     training,
+                    //     true,
+                    //     1,
+                    //     &cache,
+                    // );
+                    let li = {
+                        if let Some(isct) = scene.shape.intersect(&ray) {
+                            let p = ray.at(isct.t);
+                            let n = isct.ng;
+                            let bsdf = isct.shape.bsdf();
+                            if bsdf.is_none() {
+                                Spectrum::zero()
+                            }else{
+                                let bsdf = bsdf.unwrap();
+                                let record = QueryRecord {
+                                    x:p,
+                                    n,
+                                    info:bsdf.info(),
+                                    dir : dir_to_spherical(&ray.d)
+                                };
+                                let cache = cache.read().unwrap();
+                                cache.infer(&record).unwrap_or(Spectrum::zero())
+                            }
+                        }else{
+                            Spectrum::zero()
+                        }
+                    };
                     film.add_sample(&uvec2(x, y), &li, 1.0);
                 });
             }
@@ -3449,12 +3477,15 @@ mod test_image {
     use image::GenericImageView;
     use nalgebra as na;
     use rand::Rng;
-    create_mlp!(Net, Relu, Adam, { 2 * 8 * 2 + 2 }, 64, 64, 64, 64, 64, 3);
+    create_mlp!(Net, Relu, SGD, { 2 * 8 * 2 + 2 }, 64, 64, 64, 64, 64, 3);
 
     position_encoding_func!(position_encoding, 2, 8);
 
     pub fn test() {
-        let opt = Adam { learning_rate: 0.01,..Default::default() };
+        let opt = SGD {
+            learning_rate: 0.01,
+            ..Default::default()
+        };
         let mut net = Net::new(opt);
         let img = image::open("test.jpg").unwrap();
         let imgx = img.width();
@@ -3464,7 +3495,7 @@ mod test_image {
             na::Vector3::new(px[0] as f32, px[1] as f32, px[2] as f32) / 255.0
         };
         let mut rng = rand::thread_rng();
-        for iter in 0..1000 {
+        for iter in 0..2000000 {
             let x = na::zero::<na::SVector<f32, 2>>().map(|_| rng.gen::<f32>());
             let target = get_pixel(x);
             let loss = net.train(&position_encoding(&x), target);
@@ -3481,10 +3512,10 @@ mod test_image {
         out.save("out.jpg").unwrap();
     }
 }
-fn main() {
+fn main0() {
     test_image::test();
 }
-fn main0() {
+fn main() {
     // rayon::ThreadPoolBuilder::new()
     //     .num_threads(1)
     //     .build_global()
@@ -3556,7 +3587,7 @@ fn main0() {
     // };
     let mut integrator = nrc::CachedPathTracer {
         spp: 16,
-        training_samples: 256,
+        training_samples: 1024,
         max_depth: 3,
     };
     // let mut integrator = BDPT {
