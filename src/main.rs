@@ -1,6 +1,7 @@
 use glm::vec2;
 use glm::vec3;
 use mimalloc::MiMalloc;
+use na::DMatrix;
 pub use nalgebra as na;
 pub use nalgebra_glm as glm;
 use rand::Rng;
@@ -2602,7 +2603,7 @@ mod nn {
     }
     impl OptimizerImpl for Momentum {
         fn step(&mut self, val: &mut f32, grad: f32) {
-            self.v = self.a * self.v + self.learning_rate * grad;
+            self.v = self.a * self.v + self.learning_rate * grad.min(100.0).max(-100.0);
             *val -= self.v;
         }
     }
@@ -2644,7 +2645,7 @@ mod nn {
         pub v: f64,
         pub beta1: f64,
         pub beta2: f64,
-        pub t: usize,
+        pub t: i32,
     }
     impl Default for Adam {
         fn default() -> Self {
@@ -2665,8 +2666,8 @@ mod nn {
             // *val -= self.learning_rate * grad;
             self.m = self.beta1 * self.m + (1.0 - self.beta1) * grad;
             self.v = self.beta2 * self.v + (1.0 - self.beta2) * grad * grad;
-            let m_tilde = self.m / (1.0 - self.beta1.powf(self.t as f64));
-            let v_tilde = self.v / (1.0 - self.beta2.powf(self.t as f64));
+            let m_tilde = self.m / (1.0 - self.beta1.powi(self.t));
+            let v_tilde = self.v / (1.0 - self.beta2.powi(self.t));
 
             *val -= self.learning_rate * (m_tilde / (v_tilde.sqrt() + 1e-8f64)) as f32;
         }
@@ -3290,6 +3291,7 @@ mod nrc {
                 rayon::current_num_threads()
             ];
             for iter in 0..self.training_samples {
+                let now = std::time::Instant::now();
                 let p_samplers = &UnsafePointer::new(&mut samplers as *mut Vec<Box<dyn Sampler>>);
                 let p_per_thread_data =
                     &UnsafePointer::new(&mut per_thread_data as *mut Vec<PerThreadData>);
@@ -3319,8 +3321,8 @@ mod nrc {
                         path,
                         path_tmp,
                         training,
-                        false,
-                        1,
+                        iter >= 128,
+                        2,
                         &cache,
                     );
                     if training {
@@ -3338,8 +3340,14 @@ mod nrc {
                         }
                     }
                 });
+                println!(
+                    "training pass {} finished in {}s",
+                    iter,
+                    now.elapsed().as_secs_f32()
+                );
             }
-            {
+            // println!("visiualizing");
+            for _iter in 0..self.spp {
                 let p_samplers = &UnsafePointer::new(&mut samplers as *mut Vec<Box<dyn Sampler>>);
                 let p_per_thread_data =
                     &UnsafePointer::new(&mut per_thread_data as *mut Vec<PerThreadData>);
@@ -3358,40 +3366,40 @@ mod nrc {
                     let path = &mut thread_data.path;
                     let path_tmp = &mut thread_data.path_tmp;
                     let training = false;
-                    // let li = self.li(
-                    //     scene,
-                    //     ray,
-                    //     sampler.as_mut(),
-                    //     self.max_depth,
-                    //     path,
-                    //     path_tmp,
-                    //     training,
-                    //     true,
-                    //     1,
-                    //     &cache,
-                    // );
-                    let li = {
-                        if let Some(isct) = scene.shape.intersect(&ray) {
-                            let p = ray.at(isct.t);
-                            let n = isct.ng;
-                            let bsdf = isct.shape.bsdf();
-                            if bsdf.is_none() {
-                                Spectrum::zero()
-                            }else{
-                                let bsdf = bsdf.unwrap();
-                                let record = QueryRecord {
-                                    x:p,
-                                    n,
-                                    info:bsdf.info(),
-                                    dir : dir_to_spherical(&ray.d)
-                                };
-                                let cache = cache.read().unwrap();
-                                cache.infer(&record).unwrap_or(Spectrum::zero())
-                            }
-                        }else{
-                            Spectrum::zero()
-                        }
-                    };
+                    let li = self.li(
+                        scene,
+                        ray,
+                        sampler.as_mut(),
+                        self.max_depth,
+                        path,
+                        path_tmp,
+                        training,
+                        true,
+                        1,
+                        &cache,
+                    );
+                    // let li = {
+                    //     if let Some(isct) = scene.shape.intersect(&ray) {
+                    //         let p = ray.at(isct.t);
+                    //         let n = isct.ng;
+                    //         let bsdf = isct.shape.bsdf();
+                    //         if bsdf.is_none() {
+                    //             Spectrum::zero()
+                    //         } else {
+                    //             let bsdf = bsdf.unwrap();
+                    //             let record = QueryRecord {
+                    //                 x: p,
+                    //                 n,
+                    //                 info: bsdf.info(),
+                    //                 dir: dir_to_spherical(&ray.d),
+                    //             };
+                    //             let cache = cache.read().unwrap();
+                    //             cache.infer(&record).unwrap_or(Spectrum::zero())
+                    //         }
+                    //     } else {
+                    //         Spectrum::zero()
+                    //     }
+                    // };
                     film.add_sample(&uvec2(x, y), &li, 1.0);
                 });
             }
@@ -3423,44 +3431,50 @@ mod nrc {
 
 #[cfg(test)]
 mod tests {
-    use super::nn::mlp::CombineModules;
     // use nn::mlp
-    use super::nn::*;
+    use super::nnv2::*;
     use nalgebra as na;
     use rand::Rng;
-    create_mlp!(Net, Relu, Adam, 2, 8, 2);
     #[test]
     fn test_mlp() {
         // #[macro_use(nn::mlp)]
 
-        let opt = Momentum {
-            learning_rate: 0.01,
+        let opt_params = AdamParams {
+            learning_rate: 0.003,
             ..Default::default()
         };
-
+        let opt = Adam::new(opt_params);
         // let mut net = Model::new(sequential!(layer0, layer1));
+        let mut layers = vec![];
+        {
+            layers.push(Layer::new::<Relu>(2, 8));
+            layers.push(Layer::no_activation(8, 1));
+        }
+        let mut net = MLP::new(layers, opt);
 
-        let mut net = Net::new(opt);
-
-        fn f(x: &na::SVector<f32, 2>) -> na::SVector<f32, 2> {
+        fn f(x: &na::DMatrix<f32>) -> na::DMatrix<f32> {
             // na::SVector::<f32, 1>::new(x[0] + x[1])
-            na::SVector::<f32, 2>::new(x[0] + x[1], x[0] - x[1])
+            na::DMatrix::<f32>::from_fn(1, x.ncols(), |r, c| x[(0, c)] + x[(1, c)])
         }
         let mut rng = rand::thread_rng();
+        let batch_size = 1024;
         for iter in 0..100000 {
-            let x = na::zero::<na::SVector<f32, 2>>().map(|_| rng.gen::<f32>() * 2.0 - 1.0);
+            // let x = na::zero::<na::SVector<f32, 2>>().map(|_| rng.gen::<f32>() * 2.0 - 1.0);
+            let x =
+                na::DMatrix::<f32>::from_fn(2, batch_size, |_r, _c| rng.gen::<f32>() * 2.0 - 1.0);
             // let y = net.infer(&x);
-            let loss = net.train(&x, f(&x));
+            let loss = net.train(x.clone(), &f(&x));
             if iter % 1000 == 0 {
                 // println!("training on {} {}; {}",&x, f(&x), y);
                 println!("{} {}", iter, loss);
             }
         }
         {
-            let x = na::SVector::<f32, 2>::new(0.3, 0.2);
-            let y = net.infer(&x);
+            let x = na::DMatrix::<f32>::from_row_slice(2, 1, &[0.1, 0.2]);
+            let y = net.infer(x.clone());
             let gt = f(&x);
-            let err: f32 = (y - gt).norm();
+            let err: f32 = (&y - &gt).norm();
+            println!("y:{}, gt:{}, err = {}", y, gt, err);
             assert!(err < 0.001);
             assert!(!err.is_nan());
         }
@@ -3515,7 +3529,324 @@ mod test_image {
 fn main0() {
     test_image::test();
 }
-fn main() {
+mod nnv2 {
+    use std::{cell::RefCell, collections::LinkedList, fmt::Pointer, rc::Rc};
+
+    use nalgebra as na;
+    #[derive(Clone)]
+    struct Dual<T> {
+        pub val: T,
+        pub grad: T,
+    }
+    type MatrixXf = na::DMatrix<f32>;
+    type VectorXf = na::DVector<f32>;
+    pub trait Activation {
+        fn new() -> Self
+        where
+            Self: Sized;
+        fn forward(&self, x: &MatrixXf) -> MatrixXf;
+        fn backward(&self, x: &MatrixXf, out: Dual<&MatrixXf>) -> MatrixXf;
+    }
+    pub struct Relu {}
+    impl Activation for Relu {
+        fn new() -> Self
+        where
+            Self: Sized,
+        {
+            Self {}
+        }
+        fn forward(&self, x: &MatrixXf) -> MatrixXf {
+            x.map(|v| v.max(0.0))
+        }
+        fn backward(&self, x: &MatrixXf, out: Dual<&MatrixXf>) -> MatrixXf {
+            MatrixXf::from_fn(x.nrows(), x.ncols(), |r, c| {
+                if x[(r, c)] > 0.0 {
+                    out.grad[(r, c)]
+                } else {
+                    0.0
+                }
+            })
+        }
+    }
+    pub struct Layer {
+        pub inputs: usize,
+        pub outputs: usize,
+        pub activation: Option<Box<dyn Activation>>,
+    }
+    impl Layer {
+        pub fn new<A: Activation + 'static>(inputs: usize, outputs: usize) -> Self {
+            Layer {
+                inputs,
+                outputs,
+                activation: Some(Box::new(A::new()) as Box<dyn Activation>),
+            }
+        }
+        pub fn no_activation(inputs: usize, outputs: usize) -> Self {
+            Layer {
+                inputs,
+                outputs,
+                activation: None,
+            }
+        }
+    }
+    pub trait Optimizer: Clone {
+        fn create(&self, n: usize) -> Box<dyn OptimizerImpl>;
+    }
+    trait OptimizerImpl {
+        fn step(&mut self, val: &mut [f32], grad: &[f32]);
+    }
+
+    #[derive(Copy, Clone)]
+    pub struct SGDParams {
+        pub learning_rate: f32,
+    }
+    impl Default for SGDParams {
+        fn default() -> Self {
+            Self {
+                learning_rate: 0.003,
+            }
+        }
+    }
+    #[derive(Clone)]
+    pub struct SGD {
+        params: Rc<RefCell<SGDParams>>,
+    }
+    impl SGD {
+        pub fn new(params: SGDParams) -> Self {
+            Self {
+                params: Rc::new(RefCell::new(params)),
+            }
+        }
+    }
+    struct SGDImpl {
+        params: Rc<RefCell<SGDParams>>,
+    }
+    impl Optimizer for SGD {
+        fn create(&self, _n: usize) -> Box<dyn OptimizerImpl> {
+            Box::new(SGDImpl {
+                params: self.params.clone(),
+            })
+        }
+    }
+    impl OptimizerImpl for SGDImpl {
+        fn step(&mut self, val: &mut [f32], grad: &[f32]) {
+            let lr = self.params.borrow().learning_rate;
+            assert!(val.len() == grad.len());
+            for i in 0..val.len() {
+                val[i] -= lr * grad[i].min(100.0).max(-100.0);
+            }
+        }
+    }
+    #[derive(Clone, Copy)]
+    pub struct AdamParams {
+        pub learning_rate: f32,
+        pub beta1: f32,
+        pub beta2: f32,
+    }
+    impl Default for AdamParams{
+        fn default() -> Self {
+            Self{
+                learning_rate: 0.001,
+                beta1: 0.9,
+                beta2: 0.999,
+            }
+        }
+    }
+    #[derive(Clone)]
+    pub struct Adam {
+        params: Rc<RefCell<AdamParams>>,
+    }
+    impl Adam {
+        pub fn new(params: AdamParams) -> Self {
+            Self {
+                params: Rc::new(RefCell::new(params)),
+            }
+        }
+    }
+    impl Optimizer for Adam {
+        fn create(&self, n: usize) -> Box<dyn OptimizerImpl> {
+            Box::new(AdamImpl {
+                params: self.params.clone(),
+                m: vec![0.0; n],
+                v: vec![0.0; n],
+                t: 0,
+            })
+        }
+    }
+    struct AdamImpl {
+        params: Rc<RefCell<AdamParams>>,
+        m: Vec<f32>,
+        v: Vec<f32>,
+        t: i32,
+    }
+    impl OptimizerImpl for AdamImpl {
+        fn step(&mut self, val: &mut [f32], grad: &[f32]) {
+            let params = self.params.borrow();
+            let lr = params.learning_rate;
+            let beta1 = params.beta1;
+            let beta2 = params.beta2;
+            self.t += 1;
+
+            for i in 0..val.len() {
+                let grad = grad[i].min(100.0).max(-100.0);
+                self.m[i] = beta1 * self.m[i] + (1.0 - beta1) * grad;
+                self.v[i] = beta2 * self.v[i] + (1.0 - beta2) * grad * grad;
+            }
+            let b1 = beta1.powi(self.t);
+            let b2 = beta2.powi(self.t);
+            for i in 0..val.len() {
+                let m_tilde = self.m[i] / (1.0 - b1);
+                let v_tilde = self.v[i] / (1.0 - b2);
+                val[i] -= lr * (m_tilde / (v_tilde.sqrt() + 1e-8f32)) as f32;
+            }
+        }
+    }
+    // struct Optimizer
+    struct LayerData {
+        weights: MatrixXf,
+        bias: VectorXf,
+        activation: Option<Box<dyn Activation>>,
+    }
+    struct LayerOptimizer {
+        weights: Box<dyn OptimizerImpl>,
+        bias: Box<dyn OptimizerImpl>,
+    }
+    use rand::distributions::Distribution;
+    use statrs::distribution::Normal;
+    struct LayerOutput {
+        linear_out: MatrixXf,
+        out: MatrixXf,
+    }
+    impl LayerData {
+        fn num_inputs(&self) -> usize {
+            self.weights.ncols()
+        }
+        fn num_outputs(&self) -> usize {
+            self.weights.nrows()
+        }
+        fn new(inputs: usize, outputs: usize, activation: Option<Box<dyn Activation>>) -> Self {
+            let mut rng = rand::thread_rng();
+            let n = Normal::new(0.0, (2.0 / (inputs + outputs) as f64).sqrt()).unwrap();
+            let weights = MatrixXf::from_fn(outputs, inputs, |_r, _c| n.sample(&mut rng) as f32);
+            let bias = VectorXf::from_fn(outputs, |_r, _c| 0.0f32);
+            Self {
+                weights,
+                bias,
+                activation,
+            }
+        }
+    }
+    pub struct MLP {
+        layers: Vec<LayerData>,
+        opts: Vec<LayerOptimizer>,
+    }
+    impl MLP {
+        pub fn new<O: Optimizer>(desc: Vec<Layer>, opt: O) -> Self {
+            let mut layers = vec![];
+            let mut opts = vec![];
+            for d in desc {
+                layers.push(LayerData::new(d.inputs, d.outputs, d.activation));
+                opts.push(LayerOptimizer {
+                    weights: opt.create(d.inputs * d.outputs),
+                    bias: opt.create(d.outputs),
+                })
+            }
+            Self { layers, opts }
+        }
+        fn forward(&self, mut x: MatrixXf, tmp: &mut Vec<LayerOutput>, training: bool) -> MatrixXf {
+            for layer in &self.layers {
+                x = &layer.weights * x;
+                x = MatrixXf::from_fn(x.nrows(), x.ncols(), |r, c| x[(r, c)] + layer.bias[r]);
+                let linear_out = if training { Some(x.clone()) } else { None };
+                if let Some(f) = &layer.activation {
+                    x = f.forward(&x);
+                }
+                if training {
+                    tmp.push(LayerOutput {
+                        linear_out: linear_out.unwrap(),
+                        out: x.clone(),
+                    })
+                }
+            }
+            x
+        }
+        pub fn infer(&self, x: MatrixXf) -> MatrixXf {
+            let mut tmp = vec![];
+            self.forward(x, &mut tmp, false)
+        }
+        pub fn train(&mut self, x: MatrixXf, target: &MatrixXf) -> f32 {
+            let mut tmp = vec![];
+            let y = self.forward(x.clone(), &mut tmp, true);
+            let loss = (&y - target).map(|v| v * v).mean();
+            let dy = 0.5 * (&y - target) / (y.ncols() * y.nrows()) as f32;
+            let mut dout = dy;
+            for i in (0..self.layers.len()).rev() {
+                let layer = &self.layers[i];
+                let out = &tmp[i].out;
+                let linear_out = &tmp[i].linear_out;
+                if let Some(f) = &layer.activation {
+                    let gradf = f.backward(
+                        linear_out,
+                        Dual {
+                            val: out,
+                            grad: &dout,
+                        },
+                    );
+                    // out = linear_out;
+                    dout = gradf;
+                }
+                let input = if i == 0 { &x } else { &tmp[i - 1].out };
+                let (dw, dbias, dx) = {
+                    let dbias = dout.column_sum();
+                    let dw = &dout * input.transpose();
+                    let dx = &layer.weights.transpose() * &dout;
+                    (dw, dbias, dx)
+                };
+                let opt = &mut self.opts[i];
+                opt.weights
+                    .as_mut()
+                    .step(self.layers[i].weights.as_mut_slice(), dw.as_slice());
+                opt.bias
+                    .as_mut()
+                    .step(self.layers[i].bias.as_mut_slice(), dbias.as_slice());
+                dout = dx;
+            }
+            loss
+        }
+    }
+}
+fn gemm_bench1() {
+    let a = vec![na::DMatrix::<f32>::from_fn(64, 64, |_r, _c| { 1.0 }); 14];
+    let b = na::DMatrix::<f32>::from_fn(64, 64, |_r, _c| 1.0);
+    let now = std::time::Instant::now();
+    let mut c = &a[13] * &b;
+    for i in (0..13).rev() {
+        c = &a[i] * c;
+    }
+    let tmp = c.sum();
+    let t = now.elapsed().as_secs_f64();
+    // let flops = 2.0 * (a[0].nrows() * a[0].ncols() * b.ncols()) as f64 / t / 1e9;
+    println!("{}s {}", t, tmp);
+}
+
+fn gemm_bench2() {
+    let a = vec![na::DMatrix::<f32>::from_fn(64, 64, |_r, _c| { 1.0 }); 14];
+    let mut b = na::SMatrix::<f32, 64, 1>::from_fn(|_r, _c| 1.0);
+    let mut tmp = 0.0;
+    let now = std::time::Instant::now();
+    for _ in 0..64 {
+        let mut c = &a[13] * &b;
+        for i in (0..13).rev() {
+            c = &a[i] * c;
+        }
+        tmp += c.sum();
+    }
+    let t = now.elapsed().as_secs_f64();
+    // let flops = 2.0 * (a[0].nrows() * a[0].ncols() * 1024) as f64 / t / 1e9;
+    println!("{}s {}", t, tmp);
+}
+fn main() {}
+fn main1() {
     // rayon::ThreadPoolBuilder::new()
     //     .num_threads(1)
     //     .build_global()
@@ -3587,7 +3918,7 @@ fn main() {
     // };
     let mut integrator = nrc::CachedPathTracer {
         spp: 16,
-        training_samples: 1024,
+        training_samples: 256,
         max_depth: 3,
     };
     // let mut integrator = BDPT {
