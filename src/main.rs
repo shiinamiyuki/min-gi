@@ -3485,50 +3485,91 @@ mod tests {
     }
 }
 mod test_image {
-    use super::nn::mlp::CombineModules;
     // use nn::mlp
-    use super::nn::*;
+    use super::nnv2::*;
     use image::GenericImageView;
     use nalgebra as na;
     use rand::Rng;
-    create_mlp!(Net, Relu, SGD, { 2 * 8 * 2 + 2 }, 64, 64, 64, 64, 64, 3);
-
-    position_encoding_func!(position_encoding, 2, 8);
+    // create_mlp!(Net, Relu, SGD, { 2 * 8 * 2 + 2 }, 64, 64, 64, 64, 64, 3);
+    use crate::position_encoding_func_v2;
+    position_encoding_func_v2!(position_encoding, 2, 8);
 
     pub fn test() {
-        let opt = SGD {
-            learning_rate: 0.01,
+        let opt_params = AdamParams {
+            learning_rate: 0.003,
             ..Default::default()
         };
-        let mut net = Net::new(opt);
+        let opt = Adam::new(opt_params);
+        let mut layers = vec![];
+        {
+            layers.push(Layer::new::<Relu>(2 * 8 * 2 + 2, 64));
+            layers.push(Layer::new::<Relu>(64, 64));
+            layers.push(Layer::new::<Relu>(64, 64));
+            layers.push(Layer::new::<Relu>(64, 64));
+            layers.push(Layer::new::<Relu>(64, 64));
+            layers.push(Layer::new::<Relu>(64, 64));
+            layers.push(Layer::no_activation(64, 3));
+        }
+        let mut net = MLP::new(layers, opt);
         let img = image::open("test.jpg").unwrap();
         let imgx = img.width();
         let imgy = img.height();
-        let get_pixel = |x: na::Vector2<f32>| -> na::Vector3<f32> {
-            let px = img.get_pixel((x[0] * imgx as f32) as u32, (x[1] * imgy as f32) as u32);
-            na::Vector3::new(px[0] as f32, px[1] as f32, px[2] as f32) / 255.0
+        let get_pixel = |x: &na::DMatrix<f32>| -> na::DMatrix<f32> {
+            let mut pixels: na::DMatrix<f32> = na::DMatrix::zeros(3, x.ncols());
+            for c in 0..x.ncols() {
+                let x = x.column(c);
+                let px = img.get_pixel((x[0] * imgx as f32) as u32, (x[1] * imgy as f32) as u32);
+                for i in 0..3 {
+                    pixels[(i, c)] = px[i] as f32 / 255.0;
+                }
+            }
+            pixels
         };
         let mut rng = rand::thread_rng();
-        for iter in 0..2000000 {
-            let x = na::zero::<na::SVector<f32, 2>>().map(|_| rng.gen::<f32>());
-            let target = get_pixel(x);
-            let loss = net.train(&position_encoding(&x), target);
-            if iter % 1000 == 0 {
+        let batch_size = 5000;
+        for iter in 0..1000 {
+            let x: na::DMatrix<f32> = na::DMatrix::from_fn(2, batch_size, |r, c|->f32 {rng.gen::<f32>()});
+            let target = get_pixel(&x);
+            let loss = net.train(position_encoding(&x),  &target);
+            // if iter % 1000 == 0 {
                 // println!("training on {} {}; {}",&x, f(&x), y);
                 println!("{} {}", iter, loss);
-            }
+            // }
         }
-        let out = image::ImageBuffer::from_fn(imgx, imgy, |x, y| {
-            let x = na::Vector2::<f32>::new(x as f32 / imgx as f32, y as f32 / imgy as f32);
-            let color = net.infer(&position_encoding(&x)) * 255.0;
-            image::Rgb([color[0] as u8, color[1] as u8, color[2] as u8])
-        });
-        out.save("out.jpg").unwrap();
+        {
+            let x = na::DMatrix::<f32>::from_fn(2, (imgx * imgy) as usize, |r, c| {
+                let x = c as u32 % imgx;
+                let y = c as u32 / imgx;
+                if r == 0 {
+                    x as f32 / imgx as f32
+                } else {
+                    y as f32 / imgy as f32
+                }
+            });
+            let color = net.infer(position_encoding(&x)) * 255.0;
+            let out = image::ImageBuffer::from_fn(imgx, imgy, |x, y| {
+                let i = x + imgx * y;
+                let pixel = [
+                    color[(0, i as usize)] as u8,
+                    color[(1, i as usize)] as u8,
+                    color[(2, i as usize)] as u8,
+                ];
+                image::Rgb([pixel[0] as u8, pixel[1] as u8, pixel[2] as u8])
+            });
+            out.save("out.jpg").unwrap();
+        }
+        // let out = image::ImageBuffer::from_fn(imgx, imgy, |x, y| {
+        //     let x:na::DMatrix<f32> = na::Vector2::<f32>::new(x as f32 / imgx as f32, y as f32 / imgy as f32);
+        //     let color = net.infer(position_encoding(&x)) * 255.0;
+        //     image::Rgb([color[0] as u8, color[1] as u8, color[2] as u8])
+        // });
     }
 }
-fn main0() {
+fn main() {
     test_image::test();
 }
+
+#[macro_use]
 mod nnv2 {
     use std::{cell::RefCell, collections::LinkedList, fmt::Pointer, rc::Rc};
 
@@ -3643,9 +3684,9 @@ mod nnv2 {
         pub beta1: f32,
         pub beta2: f32,
     }
-    impl Default for AdamParams{
+    impl Default for AdamParams {
         fn default() -> Self {
-            Self{
+            Self {
                 learning_rate: 0.001,
                 beta1: 0.9,
                 beta2: 0.999,
@@ -3814,6 +3855,26 @@ mod nnv2 {
             loss
         }
     }
+    #[macro_export]
+    macro_rules! position_encoding_func_v2 {
+        ($name:ident, $N:expr, $E:expr) => {
+            fn $name(v: &na::DMatrix<f32>) -> na::DMatrix<f32> {
+                assert!(v.nrows() == $N);
+                let mut u: na::DMatrix<f32> = na::DMatrix::zeros($N * $E * 2 + $N, v.ncols());
+                for c in 0..v.ncols() {
+                    for i in 0..$N {
+                        for j in 0..$E {
+                            let feq = 2.0f32.powi(j as i32);
+                            u[(i * $E + j, c)] = (v[(i, c)] * feq).sin();
+                            u[(i * $E + j + $N * $E, c)] = (v[(i, c)] * feq).cos();
+                        }
+                        u[($N * $E * 2 + i, c)] = v[(i, c)];
+                    }
+                }
+                u
+            }
+        };
+    }
 }
 fn gemm_bench1() {
     let a = vec![na::DMatrix::<f32>::from_fn(64, 64, |_r, _c| { 1.0 }); 14];
@@ -3845,7 +3906,7 @@ fn gemm_bench2() {
     // let flops = 2.0 * (a[0].nrows() * a[0].ncols() * 1024) as f64 / t / 1e9;
     println!("{}s {}", t, tmp);
 }
-fn main() {}
+
 fn main1() {
     // rayon::ThreadPoolBuilder::new()
     //     .num_threads(1)
