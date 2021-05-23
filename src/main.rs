@@ -39,6 +39,11 @@ pub fn uvec2(x: u32, y: u32) -> glm::UVec2 {
 pub fn uvec3(x: u32, y: u32, z: u32) -> glm::UVec3 {
     glm::UVec3::new(x, y, z)
 }
+pub fn profile<F: FnOnce() -> ()>(f: F) -> f64 {
+    let now = std::time::Instant::now();
+    f();
+    now.elapsed().as_secs_f64()
+}
 pub struct AtomicFloat {
     bits: AtomicU32,
 }
@@ -2854,7 +2859,7 @@ mod nrc {
                     beta: Spectrum::one(),
                     li: Spectrum::zero(),
                     query_index: None,
-                    thread_index:0,
+                    thread_index: 0,
                 };
                 npixels
             ];
@@ -2930,44 +2935,50 @@ mod nrc {
             }
             let trained_caches = vec![cache.clone(); rayon::current_num_threads()];
             // println!("visiualizing");
-            for _iter in 0..self.spp {
+            for iter in 0..self.spp {
                 let p_samplers = &UnsafePointer::new(&mut samplers as *mut Vec<Box<dyn Sampler>>);
                 let p_per_thread_data =
                     &UnsafePointer::new(&mut per_thread_data as *mut Vec<PerThreadData>);
                 let p_states = &UnsafePointer::new(&mut states as *mut Vec<PathState>);
-                parallel_for(npixels, 256, |id| {
-                    let samplers = unsafe { p_samplers.as_mut().unwrap() };
-                    let states = unsafe { p_states.as_mut().unwrap() };
-                    let thread_data = unsafe {
-                        &mut (p_per_thread_data.as_mut().unwrap())
-                            [rayon::current_thread_index().unwrap()]
-                    };
-                    let cache = &trained_caches[rayon::current_thread_index().unwrap()];
-                    let state = &mut states[id];
-                    let sampler = &mut samplers[id];
-                    // let mut sampler = PCGSampler { rng: PCG::new(id) };
-                    let x = (id as u32) % scene.camera.resolution().x;
-                    let y = (id as u32) / scene.camera.resolution().x;
-                    let pixel = uvec2(x, y);
-                    let (ray, _ray_weight) = scene.camera.generate_ray(&pixel, sampler.as_mut());
-                    let path = &mut thread_data.path;
-                    let path_tmp = &mut thread_data.path_tmp;
-                    let training = false;
-                    *state = self.li(
-                        scene,
-                        ray,
-                        sampler.as_mut(),
-                        self.max_depth,
-                        path,
-                        path_tmp,
-                        training,
-                        true,
-                        1,
-                        &cache,
-                    );
+                let now = std::time::Instant::now();
+                let rt_time = profile(|| {
+                    parallel_for(npixels, 256, |id| {
+                        let samplers = unsafe { p_samplers.as_mut().unwrap() };
+                        let states = unsafe { p_states.as_mut().unwrap() };
+                        let thread_data = unsafe {
+                            &mut (p_per_thread_data.as_mut().unwrap())
+                                [rayon::current_thread_index().unwrap()]
+                        };
+                        let cache = &trained_caches[rayon::current_thread_index().unwrap()];
+                        let state = &mut states[id];
+                        let sampler = &mut samplers[id];
+                        // let mut sampler = PCGSampler { rng: PCG::new(id) };
+                        let x = (id as u32) % scene.camera.resolution().x;
+                        let y = (id as u32) / scene.camera.resolution().x;
+                        let pixel = uvec2(x, y);
+                        let (ray, _ray_weight) =
+                            scene.camera.generate_ray(&pixel, sampler.as_mut());
+                        let path = &mut thread_data.path;
+                        let path_tmp = &mut thread_data.path_tmp;
+                        let training = false;
+                        *state = self.li(
+                            scene,
+                            ray,
+                            sampler.as_mut(),
+                            self.max_depth,
+                            path,
+                            path_tmp,
+                            training,
+                            true,
+                            1,
+                            &cache,
+                        );
+                    });
                 });
-                parallel_for(trained_caches.len(), 1, |i| {
-                    trained_caches[i].infer();
+                let infer_time = profile(|| {
+                    parallel_for(trained_caches.len(), 1, |i| {
+                        trained_caches[i].infer();
+                    });
                 });
                 parallel_for(npixels, 256, |id| {
                     let x = (id as u32) % scene.camera.resolution().x;
@@ -2990,6 +3001,13 @@ mod nrc {
                     };
                     film.add_sample(&pixel, &li, 1.0);
                 });
+                println!(
+                    "rendering pass {} finished in {}s: ray trace {}s, infer {}s",
+                    iter,
+                    now.elapsed().as_secs_f64(),
+                    rt_time,
+                    infer_time,
+                );
             }
             // println!("visiualizing");
             // parallel_for(npixels, 256, |id| {
